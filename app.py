@@ -570,7 +570,7 @@ class App999(ctk.CTk):
 
     async def _bg_scrape(self, acc: dict):
         try:
-            listings = await scrape_account(acc, max_listings=10)
+            listings = await scrape_account(acc)
             self.after(0, lambda: self._on_listings_loaded(listings))
         except Exception as e:
             self.after(0, lambda err=e: self.status_lbl.configure(
