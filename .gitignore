@@ -1,0 +1,22 @@
+# ── User data — credentials, scraped listings, downloaded images ──────────────
+data/
+
+# ── PyInstaller artefacts (no longer used) ────────────────────────────────────
+dist/
+build/
+*.spec
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# ── Playwright ────────────────────────────────────────────────────────────────
+playwright-report/
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
