@@ -3,6 +3,7 @@
 Run: python app.py
 """
 import asyncio
+from difflib import SequenceMatcher
 import io
 import json
 import sys
@@ -59,8 +60,44 @@ def save_accounts(accounts: list):
 
 
 # ── Background async helpers ──────────────────────────────────────────────────
-async def scrape_account(acc: dict, max_listings: int = 10) -> list:
-    """Login as acc, collect last max_listings from active + inactive tabs."""
+def _listing_id(data: dict) -> int:
+    """Return the numeric listing ID from its URL — higher = more recent repost."""
+    last = (data.get("url") or "").rstrip("/").split("/")[-1]
+    return int(last) if last.isdigit() else 0
+
+
+def _fuzzy_dedup(raw: list[dict], threshold: float = 0.9) -> list[dict]:
+    """
+    Deduplicate listings by title similarity.
+    When two listings have ≥ threshold similarity, keep the most recent one
+    (highest numeric listing ID = latest repost).
+    """
+    result: list[dict] = []
+    for data in raw:
+        title = (data.get("title") or "").strip().lower()
+        if not title:
+            continue
+        match_idx = None
+        for i, kept in enumerate(result):
+            kept_t = (kept.get("title") or "").strip().lower()
+            if SequenceMatcher(None, title, kept_t).ratio() >= threshold:
+                match_idx = i
+                break
+        if match_idx is None:
+            result.append(data)
+        elif _listing_id(data) > _listing_id(result[match_idx]):
+            # This is a newer repost of the same item — replace the older one
+            result[match_idx] = data
+    return result
+
+
+async def scrape_account(acc: dict, max_active: int = 30,
+                         max_inactive: int = 15) -> list:
+    """
+    Login as acc, collect up to max_active active listing URLs and up to
+    max_inactive inactive listing URLs, scrape them all, then fuzzy-deduplicate
+    by title (≥90% similarity → same item; keep the most recent repost).
+    """
     core.EMAIL = acc["username"]
     core.PASSWORD = acc["password"]
 
@@ -71,23 +108,22 @@ async def scrape_account(acc: dict, max_listings: int = 10) -> list:
 
         await core.login(page)
 
-        # URL path segments that look numeric but are NOT listing pages
-        # URL path segments that appear BEFORE a numeric ID but are NOT listing pages.
-        # Note: "ro"/"ru"/"en" are language prefixes that legitimately precede listing IDs
-        # (e.g. 999.md/ro/103916564) so they must NOT be in this list.
         _BAD_SEGMENTS = {"profile", "cabinet", "category", "list", "add",
                          "search", "favorites", "history", "settings", "items"}
 
         ad_urls: list[str] = []
 
         for tab in ("active", "inactive"):
-            if len(ad_urls) >= max_listings * 3:  # collect extra to allow dedup
-                break
+            tab_limit = max_active if tab == "active" else max_inactive
+            tab_count = 0
+
+            print(f"  Collecting {tab} listings (up to {tab_limit})…")
             url = f"{core.BASE_URL}/ro/cabinet/items/{acc['username']}?tab={tab}"
             await page.goto(url, wait_until="domcontentloaded")
             await page.wait_for_timeout(1500)
 
-            while len(ad_urls) < max_listings * 3:
+            while tab_count < tab_limit:
+                found_on_page = 0
                 for a in await page.query_selector_all("a[href]"):
                     href = (await a.get_attribute("href")) or ""
                     if not href.startswith("http"):
@@ -95,18 +131,20 @@ async def scrape_account(acc: dict, max_listings: int = 10) -> list:
                     clean = href.split("?")[0].rstrip("/")
                     parts = clean.split("/")
                     last = parts[-1]
-                    # Must end in a pure number AND the segment before it
-                    # must NOT be a known non-listing path
                     if (last.isdigit()
                             and len(parts) >= 2
                             and parts[-2] not in _BAD_SEGMENTS
                             and clean not in ad_urls):
                         ad_urls.append(clean)
+                        tab_count += 1
+                        found_on_page += 1
+                        if tab_count >= tab_limit:
+                            break
 
-                if len(ad_urls) >= max_listings * 3:
+                if tab_count >= tab_limit or found_on_page == 0:
                     break
 
-                # pagination
+                # Next page
                 try:
                     nxt = page.locator(
                         "a[data-testid='pagination-next'], a[aria-label='Next']"
@@ -119,25 +157,24 @@ async def scrape_account(acc: dict, max_listings: int = 10) -> list:
                 except Exception:
                     break
 
-        # Scrape all collected URLs, then deduplicate by title (keep first = most recent)
-        listings: list[dict] = []
-        seen_titles: set[str] = set()
+            print(f"  Collected {tab_count} {tab} URLs")
+
+        # Scrape every URL (no early exit — we need all data for fuzzy dedup)
+        raw: list[dict] = []
         async with httpx.AsyncClient(follow_redirects=True) as client:
             for url in ad_urls:
-                if len(listings) >= max_listings:
-                    break
                 try:
                     data = await core.scrape_listing_detail(page, url, client)
-                    title_key = (data.get("title") or "").strip().lower()
-                    if not title_key or title_key in seen_titles:
-                        # Skip blank-title junk pages and duplicate reposts
-                        continue
-                    seen_titles.add(title_key)
-                    listings.append(data)
+                    if (data.get("title") or "").strip():
+                        raw.append(data)
                 except Exception as e:
                     print(f"  [WARN] scrape {url}: {e}")
 
         await browser.close()
+
+        # Fuzzy-deduplicate: same item ≥90% title similarity → keep newest repost
+        listings = _fuzzy_dedup(raw, threshold=0.9)
+        print(f"  {len(raw)} scraped → {len(listings)} unique listings after dedup")
 
         # Cache per-account
         acc_dir = DATA_DIR / acc["username"]
