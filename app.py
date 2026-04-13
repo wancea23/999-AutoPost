@@ -130,7 +130,8 @@ async def scrape_account(acc: dict, max_active: int = 30,
                 btn = page.locator(f"[data-testid='{tab_testid}']").first
                 if await btn.is_visible(timeout=3000):
                     await btn.click()
-                    await page.wait_for_timeout(1500)
+                    await page.wait_for_load_state("networkidle")
+                    await page.wait_for_timeout(1000)
                 else:
                     print(f"  [WARN] Tab button '{tab_testid}' not visible, skipping")
                     continue
@@ -138,9 +139,18 @@ async def scrape_account(acc: dict, max_active: int = 30,
                 print(f"  [WARN] Could not click tab '{tab_testid}': {e}")
                 continue
 
+            print(f"  Tab URL: {page.url}")
+
             while tab_count < tab_limit:
                 found_on_page = 0
-                for a in await page.query_selector_all("a[href]"):
+                # Use specific selector for listing title links; fall back to all links
+                listing_links = await page.query_selector_all(
+                    "a[class*='advert__title']"
+                )
+                if not listing_links:
+                    listing_links = await page.query_selector_all("a[href]")
+                print(f"  Found {len(listing_links)} candidate links on page")
+                for a in listing_links:
                     href = (await a.get_attribute("href")) or ""
                     if not href.startswith("http"):
                         href = core.BASE_URL + href
