@@ -113,12 +113,12 @@ async def scrape_account(acc: dict, max_active: int = 30,
 
         ad_urls: list[str] = []
 
-        for tab in ("active", "inactive"):
+        for tab, tab_param in (("active", "active"), ("inactive", "not-active")):
             tab_limit = max_active if tab == "active" else max_inactive
             tab_count = 0
 
             print(f"  Collecting {tab} listings (up to {tab_limit})…")
-            url = f"{core.BASE_URL}/ro/cabinet/items/{acc['username']}?tab={tab}"
+            url = f"{core.BASE_URL}/ro/cabinet/items/{acc['username']}?tab={tab_param}"
             await page.goto(url, wait_until="domcontentloaded")
             await page.wait_for_timeout(1500)
 
