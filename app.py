@@ -59,6 +59,24 @@ def save_accounts(accounts: list):
     )
 
 
+# ── Blacklist helpers ─────────────────────────────────────────────────────────
+def load_blacklist(username: str) -> set[str]:
+    path = DATA_DIR / username / "blacklist.json"
+    if path.exists():
+        try:
+            return set(json.loads(path.read_text(encoding="utf-8")))
+        except Exception:
+            return set()
+    return set()
+
+
+def save_blacklist(username: str, urls: set[str]):
+    path = DATA_DIR / username / "blacklist.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(sorted(urls), ensure_ascii=False, indent=2),
+                    encoding="utf-8")
+
+
 # ── Background async helpers ──────────────────────────────────────────────────
 def _listing_id(data: dict) -> int:
     """Return the numeric listing ID from its URL — higher = more recent repost."""
@@ -334,17 +352,44 @@ _SUBTLE_TEXT  = "#9e9e9e"
 _DIVIDER      = "#2a2a2a"
 
 
+def _make_thumb(parent, listing: dict):
+    """Build and return a thumbnail CTkFrame for a listing."""
+    thumb = ctk.CTkFrame(parent, width=80, height=60,
+                          fg_color=("#2a2a2a", "#2a2a2a"), corner_radius=8)
+    thumb.pack_propagate(False)
+    images = listing.get("local_images", [])
+    loaded = False
+    if images:
+        p = Path(images[0])
+        if p.exists():
+            try:
+                img = Image.open(p)
+                img.thumbnail((76, 56))
+                ctk_img = ctk.CTkImage(img, size=(76, 56))
+                lbl = ctk.CTkLabel(thumb, image=ctk_img, text="")
+                lbl.image = ctk_img
+                lbl.pack(expand=True)
+                loaded = True
+            except Exception:
+                pass
+    if not loaded:
+        ctk.CTkLabel(thumb, text="", font=ctk.CTkFont(size=20),
+                      text_color=_SUBTLE_TEXT).pack(expand=True)
+    return thumb
+
+
 # ── Single listing row ────────────────────────────────────────────────────────
 class ListingRow(ctk.CTkFrame):
-    def __init__(self, parent, listing: dict, var: tk.BooleanVar, on_change):
+    def __init__(self, parent, listing: dict, var: tk.BooleanVar,
+                 on_change, on_blacklist):
         super().__init__(parent, corner_radius=10,
                          fg_color=(_CARD_DARK, _CARD_DARK),
                          border_width=1, border_color=(_DIVIDER, _DIVIDER))
         self.listing = listing
         self.var = var
-        self._build(on_change)
+        self._build(on_change, on_blacklist)
 
-    def _build(self, on_change):
+    def _build(self, on_change, on_blacklist):
         # Checkbox
         ctk.CTkCheckBox(self, text="", variable=self.var,
                          width=28, checkbox_width=20, checkbox_height=20,
@@ -354,36 +399,11 @@ class ListingRow(ctk.CTkFrame):
             side="left", padx=(12, 6), pady=12)
 
         # Thumbnail
-        thumb = ctk.CTkFrame(self, width=80, height=60,
-                              fg_color=("#2a2a2a", "#2a2a2a"),
-                              corner_radius=8)
-        thumb.pack(side="left", padx=(0, 8), pady=10)
-        thumb.pack_propagate(False)
-
-        images = self.listing.get("local_images", [])
-        loaded = False
-        if images:
-            p = Path(images[0])
-            if p.exists():
-                try:
-                    img = Image.open(p)
-                    img.thumbnail((76, 56))
-                    ctk_img = ctk.CTkImage(img, size=(76, 56))
-                    lbl = ctk.CTkLabel(thumb, image=ctk_img, text="",
-                                       corner_radius=6)
-                    lbl.image = ctk_img
-                    lbl.pack(expand=True)
-                    loaded = True
-                except Exception:
-                    pass
-        if not loaded:
-            ctk.CTkLabel(thumb, text="",
-                          font=ctk.CTkFont(size=20),
-                          text_color=_SUBTLE_TEXT).pack(expand=True)
+        _make_thumb(self, self.listing).pack(side="left", padx=(0, 8), pady=10)
 
         # Text info
         info = ctk.CTkFrame(self, fg_color="transparent")
-        info.pack(side="left", fill="both", expand=True, padx=(0, 12))
+        info.pack(side="left", fill="both", expand=True, padx=(0, 4))
 
         title = (self.listing.get("title") or "Untitled")[:75]
         ctk.CTkLabel(info, text=title, anchor="w",
@@ -392,13 +412,103 @@ class ListingRow(ctk.CTkFrame):
 
         price = self.listing.get("price", "")
         uid = (self.listing.get("url") or "").rstrip("/").split("/")[-1]
-        meta_parts = []
-        if price:
-            meta_parts.append(price)
-        meta_parts.append(f"#{uid}")
+        meta_parts = ([price] if price else []) + [f"#{uid}"]
         ctk.CTkLabel(info, text="  ·  ".join(meta_parts),
                      anchor="w", font=ctk.CTkFont(size=11),
                      text_color=_SUBTLE_TEXT).pack(fill="x", pady=(0, 8))
+
+        # Blacklist button
+        ctk.CTkButton(
+            self, text="Ban", width=46, height=26,
+            corner_radius=6,
+            font=ctk.CTkFont(size=11),
+            fg_color="transparent",
+            border_width=1, border_color=(_DIVIDER, _DIVIDER),
+            text_color=_SUBTLE_TEXT,
+            hover_color=("#3a1010", "#3a1010"),
+            command=on_blacklist
+        ).pack(side="right", padx=(4, 12))
+
+
+# ── Blacklist dialog ──────────────────────────────────────────────────────────
+class BlacklistDialog(ctk.CTkToplevel):
+    def __init__(self, parent, username: str, blacklist: set[str],
+                 all_listings: list, on_remove):
+        super().__init__(parent)
+        self.title(f"Blacklist — @{username}")
+        self.geometry("640x480")
+        self.configure(fg_color=_BG_DARK)
+        self.grab_set()
+        self._on_remove = on_remove
+        self._build(username, blacklist, all_listings)
+
+    def _build(self, username, blacklist, all_listings):
+        # Header
+        hdr = ctk.CTkFrame(self, fg_color="transparent")
+        hdr.pack(fill="x", padx=20, pady=(16, 4))
+        ctk.CTkLabel(hdr, text=f"Blacklisted listings for @{username}",
+                     font=ctk.CTkFont(size=15, weight="bold")).pack(side="left")
+        ctk.CTkLabel(hdr, text=f"{len(blacklist)} item(s)",
+                     font=ctk.CTkFont(size=12),
+                     text_color=_SUBTLE_TEXT).pack(side="right")
+
+        ctk.CTkFrame(self, height=1, fg_color=(_DIVIDER, _DIVIDER)).pack(
+            fill="x", padx=20, pady=(4, 8))
+
+        if not blacklist:
+            ctk.CTkLabel(self, text="No blacklisted listings.",
+                         text_color=_SUBTLE_TEXT,
+                         font=ctk.CTkFont(size=13)).pack(expand=True)
+            return
+
+        # Build lookup: url → listing data (for thumbnail/title/price)
+        url_map = {l.get("url", "").rstrip("/"): l for l in all_listings}
+
+        scroll = ctk.CTkScrollableFrame(self, fg_color="transparent",
+                                         scrollbar_button_color=_DIVIDER)
+        scroll.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+
+        for url in sorted(blacklist):
+            listing = url_map.get(url.rstrip("/"), {"url": url})
+            self._add_row(scroll, listing, url)
+
+    def _add_row(self, parent, listing, url):
+        row = ctk.CTkFrame(parent, corner_radius=10,
+                            fg_color=(_CARD_DARK, _CARD_DARK),
+                            border_width=1, border_color=(_DIVIDER, _DIVIDER))
+        row.pack(fill="x", pady=3)
+
+        _make_thumb(row, listing).pack(side="left", padx=(10, 8), pady=8)
+
+        info = ctk.CTkFrame(row, fg_color="transparent")
+        info.pack(side="left", fill="both", expand=True)
+
+        title = (listing.get("title") or url)[:70]
+        ctk.CTkLabel(info, text=title, anchor="w",
+                     font=ctk.CTkFont(size=12, weight="bold")).pack(
+            fill="x", pady=(8, 2))
+
+        price = listing.get("price", "")
+        uid = url.rstrip("/").split("/")[-1]
+        meta = ("  ·  ".join(([price] if price else []) + [f"#{uid}"]))
+        ctk.CTkLabel(info, text=meta, anchor="w",
+                     font=ctk.CTkFont(size=11),
+                     text_color=_SUBTLE_TEXT).pack(fill="x", pady=(0, 8))
+
+        ctk.CTkButton(
+            row, text="Remove", width=72, height=28,
+            corner_radius=6,
+            font=ctk.CTkFont(size=11),
+            fg_color="transparent",
+            border_width=1, border_color=(_ACCENT, _ACCENT),
+            text_color=_ACCENT,
+            hover_color=("#3a1010", "#3a1010"),
+            command=lambda u=url, r=row: self._remove(u, r)
+        ).pack(side="right", padx=12)
+
+    def _remove(self, url, row_widget):
+        self._on_remove(url)
+        row_widget.destroy()
 
 
 # ── Main window ───────────────────────────────────────────────────────────────
@@ -416,6 +526,7 @@ class App999(ctk.CTk):
         self.selected_account: dict | None = None
         self.listings: list = []
         self.listing_vars: list[tk.BooleanVar] = []
+        self.blacklist: set[str] = set()   # per-account, loaded on account select
 
         self._build_ui()
         sys.stdout = GuiLogger(self.console_text)
@@ -558,7 +669,19 @@ class App999(ctk.CTk):
             text_color=_SUBTLE_TEXT,
             hover_color=(_CARD_HOVER, _CARD_HOVER),
             command=self._toggle_all
-        ).pack(side="left")
+        ).pack(side="left", padx=(0, 6))
+
+        self.blacklist_btn = ctk.CTkButton(
+            btn_frame, text="Blacklist (0)", width=110,
+            height=32, corner_radius=8,
+            font=ctk.CTkFont(size=11),
+            fg_color="transparent",
+            border_width=1, border_color=(_DIVIDER, _DIVIDER),
+            text_color=_SUBTLE_TEXT,
+            hover_color=(_CARD_HOVER, _CARD_HOVER),
+            command=self._open_blacklist
+        )
+        self.blacklist_btn.pack(side="left")
 
         # Divider line
         ctk.CTkFrame(right, height=1, fg_color=(_DIVIDER, _DIVIDER)).pack(
@@ -675,6 +798,8 @@ class App999(ctk.CTk):
     def _load_account(self, acc: dict):
         """Select an account and load its cached listings (no network call)."""
         self.selected_account = acc
+        self.blacklist = load_blacklist(acc["username"])
+        self._update_blacklist_btn()
         self._refresh_sidebar()
         self._clear_listings()
 
@@ -692,7 +817,7 @@ class App999(ctk.CTk):
         self.listings_lbl.configure(
             text=f"@{acc['username']} — no cache yet")
         self.status_lbl.configure(
-            text="No cached listings. Press ⟳ Refresh to scan 999.md.")
+            text="No cached listings. Press Refresh to scan 999.md.")
 
     def _refresh_listings(self):
         """Scan 999.md for fresh listings for the selected account."""
@@ -722,7 +847,10 @@ class App999(ctk.CTk):
                 state="normal", text="Refresh"))
 
     def _on_listings_loaded(self, listings: list, from_cache: bool = False):
-        self.listings = listings
+        # Filter out blacklisted listings
+        visible = [l for l in listings
+                   if l.get("url", "").rstrip("/") not in self.blacklist]
+        self.listings = visible
         self.listing_vars = []
 
         for w in self.listings_scroll.winfo_children():
@@ -730,20 +858,23 @@ class App999(ctk.CTk):
 
         uname = self.selected_account["username"] if self.selected_account else "?"
         suffix = "  (cached)" if from_cache else ""
+        hidden = len(listings) - len(visible)
+        hidden_txt = f", {hidden} hidden" if hidden else ""
         self.listings_lbl.configure(
-            text=f"@{uname} — {len(listings)} listing(s){suffix}")
+            text=f"@{uname} — {len(visible)} listing(s){hidden_txt}{suffix}")
 
-        for listing in listings:
+        for listing in visible:
             var = tk.BooleanVar(value=False)
             self.listing_vars.append(var)
             ListingRow(self.listings_scroll, listing, var,
-                       on_change=self._update_repost_btn).pack(
-                fill="x", pady=3, padx=2)
+                       on_change=self._update_repost_btn,
+                       on_blacklist=lambda l=listing: self._blacklist_listing(l)
+                       ).pack(fill="x", pady=3, padx=2)
 
         self._update_repost_btn()
         src = "cache" if from_cache else "999.md"
         self.status_lbl.configure(
-            text=f"Loaded {len(listings)} listing(s) from {src}.")
+            text=f"Loaded {len(visible)} listing(s) from {src}.")
 
     def _clear_listings(self):
         for w in self.listings_scroll.winfo_children():
@@ -751,6 +882,63 @@ class App999(ctk.CTk):
         self.listings = []
         self.listing_vars = []
         self._update_repost_btn()
+
+    # ── Blacklist ─────────────────────────────────────────────────────────────
+    def _blacklist_listing(self, listing: dict):
+        url = listing.get("url", "").rstrip("/")
+        if not url or not self.selected_account:
+            return
+        self.blacklist.add(url)
+        save_blacklist(self.selected_account["username"], self.blacklist)
+        self._update_blacklist_btn()
+        # Remove from displayed listings
+        idx = next((i for i, l in enumerate(self.listings)
+                    if l.get("url", "").rstrip("/") == url), None)
+        if idx is not None:
+            self.listings.pop(idx)
+            var = self.listing_vars.pop(idx)
+            var.set(False)
+        # Rebuild the scroll area
+        rows = list(self.listings_scroll.winfo_children())
+        if idx is not None and idx < len(rows):
+            rows[idx].destroy()
+        self._update_repost_btn()
+        uname = self.selected_account["username"]
+        self.listings_lbl.configure(
+            text=f"@{uname} — {len(self.listings)} listing(s)")
+
+    def _unblacklist(self, url: str):
+        self.blacklist.discard(url.rstrip("/"))
+        if self.selected_account:
+            save_blacklist(self.selected_account["username"], self.blacklist)
+        self._update_blacklist_btn()
+
+    def _update_blacklist_btn(self):
+        n = len(self.blacklist)
+        self.blacklist_btn.configure(
+            text=f"Blacklist ({n})",
+            text_color=_ACCENT if n else _SUBTLE_TEXT,
+            border_color=(_ACCENT if n else _DIVIDER,
+                          _ACCENT if n else _DIVIDER))
+
+    def _open_blacklist(self):
+        if not self.selected_account:
+            return
+        # Collect all known listing data (current + cached) for lookup
+        all_listings = self.listings.copy()
+        cached_path = DATA_DIR / self.selected_account["username"] / "listings.json"
+        if cached_path.exists():
+            try:
+                all_listings = json.loads(cached_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        BlacklistDialog(
+            self,
+            username=self.selected_account["username"],
+            blacklist=self.blacklist,
+            all_listings=all_listings,
+            on_remove=self._unblacklist
+        )
 
     def _toggle_all(self):
         all_on = all(v.get() for v in self.listing_vars)
