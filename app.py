@@ -278,29 +278,41 @@ class AddAccountDialog(ctk.CTkToplevel):
     def __init__(self, parent, on_save):
         super().__init__(parent)
         self.title("Add Account")
-        self.geometry("340x230")
+        self.geometry("380x260")
         self.resizable(False, False)
+        self.configure(fg_color=_CARD_DARK)
         self.grab_set()
         self.on_save = on_save
         self._build()
 
     def _build(self):
         ctk.CTkLabel(self, text="Add 999.md Account",
-                     font=ctk.CTkFont(size=15, weight="bold")).pack(pady=(20, 12))
+                     font=ctk.CTkFont(size=16, weight="bold")).pack(
+            pady=(24, 16))
 
-        ctk.CTkLabel(self, text="Username or Email", anchor="w").pack(
-            anchor="w", padx=30)
-        self.user_entry = ctk.CTkEntry(self, width=280,
-                                        placeholder_text="your_username")
-        self.user_entry.pack(padx=30, pady=(3, 10))
+        ctk.CTkLabel(self, text="Username or Email", anchor="w",
+                     font=ctk.CTkFont(size=11),
+                     text_color=_SUBTLE_TEXT).pack(anchor="w", padx=36)
+        self.user_entry = ctk.CTkEntry(self, width=308, height=36,
+                                        corner_radius=8,
+                                        placeholder_text="your_username",
+                                        border_color=_DIVIDER)
+        self.user_entry.pack(padx=36, pady=(4, 12))
 
-        ctk.CTkLabel(self, text="Password", anchor="w").pack(anchor="w", padx=30)
-        self.pass_entry = ctk.CTkEntry(self, width=280, show="●",
-                                        placeholder_text="••••••••")
-        self.pass_entry.pack(padx=30, pady=(3, 14))
+        ctk.CTkLabel(self, text="Password", anchor="w",
+                     font=ctk.CTkFont(size=11),
+                     text_color=_SUBTLE_TEXT).pack(anchor="w", padx=36)
+        self.pass_entry = ctk.CTkEntry(self, width=308, height=36,
+                                        corner_radius=8, show="*",
+                                        placeholder_text="password",
+                                        border_color=_DIVIDER)
+        self.pass_entry.pack(padx=36, pady=(4, 18))
 
-        ctk.CTkButton(self, text="Save Account", width=280,
-                      command=self._save).pack(padx=30)
+        ctk.CTkButton(self, text="Save Account", width=308, height=38,
+                      corner_radius=8,
+                      fg_color=_ACCENT, hover_color=_ACCENT_HOVER,
+                      font=ctk.CTkFont(size=13, weight="bold"),
+                      command=self._save).pack(padx=36)
 
     def _save(self):
         u = self.user_entry.get().strip()
@@ -310,10 +322,24 @@ class AddAccountDialog(ctk.CTkToplevel):
             self.destroy()
 
 
+# ── Theme constants ──────────────────────────────────────────────────────────
+_ACCENT       = "#e53935"          # vibrant red
+_ACCENT_HOVER = "#c62828"
+_ACCENT_DARK  = "#b71c1c"
+_BG_DARK      = "#121212"
+_CARD_DARK    = "#1e1e1e"
+_CARD_HOVER   = "#262626"
+_SIDEBAR_BG   = "#181818"
+_SUBTLE_TEXT  = "#9e9e9e"
+_DIVIDER      = "#2a2a2a"
+
+
 # ── Single listing row ────────────────────────────────────────────────────────
 class ListingRow(ctk.CTkFrame):
     def __init__(self, parent, listing: dict, var: tk.BooleanVar, on_change):
-        super().__init__(parent, corner_radius=8)
+        super().__init__(parent, corner_radius=10,
+                         fg_color=(_CARD_DARK, _CARD_DARK),
+                         border_width=1, border_color=(_DIVIDER, _DIVIDER))
         self.listing = listing
         self.var = var
         self._build(on_change)
@@ -321,13 +347,17 @@ class ListingRow(ctk.CTkFrame):
     def _build(self, on_change):
         # Checkbox
         ctk.CTkCheckBox(self, text="", variable=self.var,
-                         width=32, command=on_change).pack(
-            side="left", padx=(10, 4), pady=10)
+                         width=28, checkbox_width=20, checkbox_height=20,
+                         fg_color=_ACCENT, hover_color=_ACCENT_HOVER,
+                         border_color=_SUBTLE_TEXT,
+                         command=on_change).pack(
+            side="left", padx=(12, 6), pady=12)
 
         # Thumbnail
-        thumb = ctk.CTkFrame(self, width=74, height=58,
-                              fg_color="gray25", corner_radius=6)
-        thumb.pack(side="left", padx=4, pady=8)
+        thumb = ctk.CTkFrame(self, width=80, height=60,
+                              fg_color=("#2a2a2a", "#2a2a2a"),
+                              corner_radius=8)
+        thumb.pack(side="left", padx=(0, 8), pady=10)
         thumb.pack_propagate(False)
 
         images = self.listing.get("local_images", [])
@@ -337,32 +367,38 @@ class ListingRow(ctk.CTkFrame):
             if p.exists():
                 try:
                     img = Image.open(p)
-                    img.thumbnail((70, 54))
-                    ctk_img = ctk.CTkImage(img, size=(70, 54))
-                    lbl = ctk.CTkLabel(thumb, image=ctk_img, text="")
-                    lbl.image = ctk_img  # keep reference
+                    img.thumbnail((76, 56))
+                    ctk_img = ctk.CTkImage(img, size=(76, 56))
+                    lbl = ctk.CTkLabel(thumb, image=ctk_img, text="",
+                                       corner_radius=6)
+                    lbl.image = ctk_img
                     lbl.pack(expand=True)
                     loaded = True
                 except Exception:
                     pass
         if not loaded:
-            ctk.CTkLabel(thumb, text="🖼",
-                          font=ctk.CTkFont(size=22)).pack(expand=True)
+            ctk.CTkLabel(thumb, text="",
+                          font=ctk.CTkFont(size=20),
+                          text_color=_SUBTLE_TEXT).pack(expand=True)
 
         # Text info
         info = ctk.CTkFrame(self, fg_color="transparent")
-        info.pack(side="left", fill="both", expand=True, padx=8)
+        info.pack(side="left", fill="both", expand=True, padx=(0, 12))
 
-        title = (self.listing.get("title") or "Untitled")[:70]
+        title = (self.listing.get("title") or "Untitled")[:75]
         ctk.CTkLabel(info, text=title, anchor="w",
                      font=ctk.CTkFont(size=13, weight="bold")).pack(
-            fill="x", pady=(8, 2))
+            fill="x", pady=(10, 3))
 
         price = self.listing.get("price", "")
         uid = (self.listing.get("url") or "").rstrip("/").split("/")[-1]
-        ctk.CTkLabel(info, text=f"{price}  ·  #{uid}",
+        meta_parts = []
+        if price:
+            meta_parts.append(price)
+        meta_parts.append(f"#{uid}")
+        ctk.CTkLabel(info, text="  ·  ".join(meta_parts),
                      anchor="w", font=ctk.CTkFont(size=11),
-                     text_color="gray55").pack(fill="x")
+                     text_color=_SUBTLE_TEXT).pack(fill="x", pady=(0, 8))
 
 
 # ── Main window ───────────────────────────────────────────────────────────────
@@ -370,10 +406,11 @@ class App999(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("999 AutoPost")
-        self.geometry("1060x700")
-        self.minsize(820, 520)
+        self.geometry("1100x720")
+        self.minsize(860, 540)
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
+        self.configure(fg_color=_BG_DARK)
 
         self.accounts: list = load_accounts()
         self.selected_account: dict | None = None
@@ -399,117 +436,177 @@ class App999(ctk.CTk):
                 pass
 
         # ── Header ────────────────────────────────────────────────────────────
-        hdr = ctk.CTkFrame(self, height=64, corner_radius=0,
-                            fg_color=("#b71c1c", "#7f0000"))
+        hdr = ctk.CTkFrame(self, height=56, corner_radius=0,
+                            fg_color=(_CARD_DARK, _CARD_DARK),
+                            border_width=0)
         hdr.pack(fill="x")
         hdr.pack_propagate(False)
+
+        # Accent strip at top
+        accent_strip = ctk.CTkFrame(hdr, height=3, corner_radius=0,
+                                     fg_color=(_ACCENT, _ACCENT))
+        accent_strip.pack(fill="x", side="top")
+
+        hdr_inner = ctk.CTkFrame(hdr, fg_color="transparent")
+        hdr_inner.pack(fill="both", expand=True, padx=16)
 
         # Logo in header
         logo_path = ASSETS_DIR / "logo.png"
         if logo_path.exists():
             try:
                 logo_img = Image.open(logo_path)
-                ctk_logo = ctk.CTkImage(logo_img, size=(44, 44))
-                ctk.CTkLabel(hdr, image=ctk_logo, text="").pack(
-                    side="left", padx=(14, 6), pady=10)
+                ctk_logo = ctk.CTkImage(logo_img, size=(36, 36))
+                ctk.CTkLabel(hdr_inner, image=ctk_logo, text="").pack(
+                    side="left", padx=(0, 10))
             except Exception:
                 pass
 
         ctk.CTkLabel(
-            hdr, text='999 AutoPost',
-            font=ctk.CTkFont(size=22, weight="bold"),
+            hdr_inner, text="999 AutoPost",
+            font=ctk.CTkFont(family="Segoe UI", size=20, weight="bold"),
             text_color="white"
-        ).pack(side="left", pady=10)
+        ).pack(side="left")
+
+        ctk.CTkLabel(
+            hdr_inner, text="v1.0",
+            font=ctk.CTkFont(size=11),
+            text_color=_SUBTLE_TEXT
+        ).pack(side="left", padx=(8, 0), pady=(4, 0))
 
         # ── Body ──────────────────────────────────────────────────────────────
         body = ctk.CTkFrame(self, fg_color="transparent")
-        body.pack(fill="both", expand=True, padx=10, pady=10)
+        body.pack(fill="both", expand=True, padx=0, pady=0)
 
         # ── Sidebar ───────────────────────────────────────────────────────────
-        self.sidebar = ctk.CTkFrame(body, width=215, corner_radius=10)
-        self.sidebar.pack(side="left", fill="y", padx=(0, 10))
+        self.sidebar = ctk.CTkFrame(body, width=230, corner_radius=0,
+                                     fg_color=(_SIDEBAR_BG, _SIDEBAR_BG),
+                                     border_width=0)
+        self.sidebar.pack(side="left", fill="y", padx=0)
         self.sidebar.pack_propagate(False)
 
-        ctk.CTkLabel(self.sidebar, text="Accounts",
-                     font=ctk.CTkFont(size=14, weight="bold")).pack(
-            pady=(14, 6), padx=12)
+        # Sidebar header
+        sidebar_hdr = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        sidebar_hdr.pack(fill="x", padx=16, pady=(18, 10))
+        ctk.CTkLabel(sidebar_hdr, text="Accounts",
+                     font=ctk.CTkFont(size=12, weight="bold"),
+                     text_color=_SUBTLE_TEXT).pack(side="left")
 
-        self.acc_scroll = ctk.CTkScrollableFrame(self.sidebar)
-        self.acc_scroll.pack(fill="both", expand=True, padx=6, pady=(0, 4))
+        self.acc_scroll = ctk.CTkScrollableFrame(
+            self.sidebar, fg_color="transparent",
+            scrollbar_button_color=_DIVIDER,
+            scrollbar_button_hover_color=_SUBTLE_TEXT)
+        self.acc_scroll.pack(fill="both", expand=True, padx=8, pady=(0, 6))
 
         ctk.CTkButton(
-            self.sidebar, text="＋  Add Account",
+            self.sidebar, text="+ Add Account",
+            font=ctk.CTkFont(size=12),
+            height=36, corner_radius=8,
+            fg_color=_ACCENT, hover_color=_ACCENT_HOVER,
             command=self._open_add_dialog
-        ).pack(fill="x", padx=10, pady=(4, 12))
+        ).pack(fill="x", padx=14, pady=(6, 16))
 
         # ── Right panel ───────────────────────────────────────────────────────
-        right = ctk.CTkFrame(body, corner_radius=10)
+        right = ctk.CTkFrame(body, corner_radius=0,
+                              fg_color=(_BG_DARK, _BG_DARK))
         right.pack(side="left", fill="both", expand=True)
 
         # Top bar inside right panel
-        top_bar = ctk.CTkFrame(right, height=48, fg_color="transparent")
-        top_bar.pack(fill="x", padx=14, pady=(10, 2))
+        top_bar = ctk.CTkFrame(right, height=52, fg_color="transparent")
+        top_bar.pack(fill="x", padx=20, pady=(14, 6))
         top_bar.pack_propagate(False)
 
         self.listings_lbl = ctk.CTkLabel(
-            top_bar, text="← Select an account to load its listings",
-            font=ctk.CTkFont(size=13), anchor="w"
+            top_bar, text="Select an account to load listings",
+            font=ctk.CTkFont(size=14, weight="bold"), anchor="w"
         )
         self.listings_lbl.pack(side="left", fill="y")
 
-        ctk.CTkButton(
-            top_bar, text="Select All", width=108,
-            command=self._toggle_all
-        ).pack(side="right")
-
-        self.refresh_btn = ctk.CTkButton(
-            top_bar, text="⟳  Refresh", width=108,
-            command=self._refresh_listings
-        )
-        self.refresh_btn.pack(side="right", padx=(0, 6))
+        # Action buttons — right side
+        btn_frame = ctk.CTkFrame(top_bar, fg_color="transparent")
+        btn_frame.pack(side="right")
 
         self.console_btn = ctk.CTkButton(
-            top_bar, text="Console ▼", width=100,
-            fg_color="transparent", border_width=1,
+            btn_frame, text="Console", width=90,
+            height=32, corner_radius=8,
+            font=ctk.CTkFont(size=11),
+            fg_color="transparent",
+            border_width=1, border_color=(_DIVIDER, _DIVIDER),
+            text_color=_SUBTLE_TEXT,
+            hover_color=(_CARD_HOVER, _CARD_HOVER),
             command=self._toggle_console
         )
-        self.console_btn.pack(side="right", padx=(0, 6))
+        self.console_btn.pack(side="left", padx=(0, 6))
+
+        self.refresh_btn = ctk.CTkButton(
+            btn_frame, text="Refresh", width=90,
+            height=32, corner_radius=8,
+            font=ctk.CTkFont(size=11),
+            fg_color="transparent",
+            border_width=1, border_color=(_DIVIDER, _DIVIDER),
+            text_color=_SUBTLE_TEXT,
+            hover_color=(_CARD_HOVER, _CARD_HOVER),
+            command=self._refresh_listings
+        )
+        self.refresh_btn.pack(side="left", padx=(0, 6))
+
+        ctk.CTkButton(
+            btn_frame, text="Select All", width=90,
+            height=32, corner_radius=8,
+            font=ctk.CTkFont(size=11),
+            fg_color="transparent",
+            border_width=1, border_color=(_DIVIDER, _DIVIDER),
+            text_color=_SUBTLE_TEXT,
+            hover_color=(_CARD_HOVER, _CARD_HOVER),
+            command=self._toggle_all
+        ).pack(side="left")
+
+        # Divider line
+        ctk.CTkFrame(right, height=1, fg_color=(_DIVIDER, _DIVIDER)).pack(
+            fill="x", padx=20, pady=(0, 4))
 
         # Scrollable listing area
-        self.listings_scroll = ctk.CTkScrollableFrame(right)
-        self.listings_scroll.pack(fill="both", expand=True, padx=8, pady=4)
+        self.listings_scroll = ctk.CTkScrollableFrame(
+            right, fg_color="transparent",
+            scrollbar_button_color=_DIVIDER,
+            scrollbar_button_hover_color=_SUBTLE_TEXT)
+        self.listings_scroll.pack(fill="both", expand=True, padx=14, pady=4)
 
         # Console panel — hidden until toggled
         self.console_frame = ctk.CTkFrame(right, fg_color="transparent")
-        # (not packed here — shown via _toggle_console)
         self.console_text = ctk.CTkTextbox(
-            self.console_frame, height=160, state="disabled",
+            self.console_frame, height=150, state="disabled",
+            corner_radius=8,
             font=ctk.CTkFont(family="Consolas", size=11),
-            fg_color=("#111111", "#0a0a0a"),
-            text_color=("#00dd55", "#00ff66"),
+            fg_color=("#0d0d0d", "#0d0d0d"),
+            text_color=("#4caf50", "#66bb6a"),
+            border_width=1, border_color=(_DIVIDER, _DIVIDER),
         )
-        self.console_text.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        self.console_text.pack(fill="both", expand=True, padx=14, pady=(0, 4))
 
         # Bottom bar
-        bot = ctk.CTkFrame(right, height=56, fg_color="transparent")
-        bot.pack(fill="x", padx=14, pady=(2, 10))
+        bot = ctk.CTkFrame(right, height=60, fg_color="transparent")
+        bot.pack(fill="x", padx=20, pady=(4, 14))
         bot.pack_propagate(False)
-        self._bot = bot   # saved for console insertion order
+        self._bot = bot
 
         self.status_lbl = ctk.CTkLabel(
-            bot, text="Ready.", font=ctk.CTkFont(size=12))
+            bot, text="Ready",
+            font=ctk.CTkFont(size=12),
+            text_color=_SUBTLE_TEXT)
         self.status_lbl.pack(side="left", fill="y")
 
-        self.progress = ctk.CTkProgressBar(bot, width=160)
+        self.progress = ctk.CTkProgressBar(bot, width=160,
+                                            progress_color=_ACCENT)
         self.progress.set(0)
 
         self.repost_btn = ctk.CTkButton(
             bot,
             text="Repost Selected  (0)",
             font=ctk.CTkFont(size=13, weight="bold"),
-            height=40, width=230,
-            fg_color=("#b71c1c", "#7f0000"),
-            hover_color=("#8b0000", "#5a0000"),
+            height=42, width=220,
+            corner_radius=10,
+            fg_color=_ACCENT,
+            hover_color=_ACCENT_HOVER,
             command=self._start_repost
         )
         self.repost_btn.pack(side="right")
@@ -522,29 +619,38 @@ class App999(ctk.CTk):
         for acc in self.accounts:
             active = (self.selected_account and
                       self.selected_account["username"] == acc["username"])
-            row = ctk.CTkFrame(self.acc_scroll, corner_radius=6)
+            row = ctk.CTkFrame(self.acc_scroll, corner_radius=8,
+                                fg_color=(_ACCENT_DARK if active
+                                          else _CARD_DARK,
+                                          _ACCENT_DARK if active
+                                          else _CARD_DARK),
+                                border_width=1 if active else 0,
+                                border_color=(_ACCENT, _ACCENT))
             row.pack(fill="x", pady=3)
 
             ctk.CTkButton(
                 row,
-                text=f"@{acc['username']}",
+                text=f"  @{acc['username']}",
                 font=ctk.CTkFont(size=12,
                                   weight="bold" if active else "normal"),
-                fg_color=("#8b0000", "#5a0000") if active
-                          else ("gray17", "gray17"),
-                hover_color=("#b71c1c", "#7f0000"),
+                fg_color="transparent",
+                hover_color=(_CARD_HOVER, _CARD_HOVER),
+                text_color="white" if active else _SUBTLE_TEXT,
                 anchor="w",
+                height=34,
                 command=lambda a=acc: self._load_account(a)
             ).pack(side="left", fill="x", expand=True,
-                   padx=(6, 2), pady=5)
+                   padx=(4, 0), pady=4)
 
             ctk.CTkButton(
-                row, text="✕", width=28, height=28,
+                row, text="x", width=26, height=26,
+                corner_radius=6,
+                font=ctk.CTkFont(size=11),
                 fg_color="transparent",
-                text_color=("gray50", "gray45"),
-                hover_color=("gray25", "gray25"),
+                text_color=(_SUBTLE_TEXT, _SUBTLE_TEXT),
+                hover_color=("#3a1010", "#3a1010"),
                 command=lambda a=acc: self._delete_account(a)
-            ).pack(side="right", padx=(2, 6), pady=5)
+            ).pack(side="right", padx=(0, 6), pady=4)
 
     def _open_add_dialog(self):
         AddAccountDialog(self, on_save=self._on_account_saved)
@@ -593,8 +699,8 @@ class App999(ctk.CTk):
         if not self.selected_account:
             return
         acc = self.selected_account
-        self.refresh_btn.configure(state="disabled", text="Scanning…")
-        self.listings_lbl.configure(text=f"Scanning @{acc['username']}…")
+        self.refresh_btn.configure(state="disabled", text="Scanning...")
+        self.listings_lbl.configure(text=f"Scanning @{acc['username']}...")
         self._show_progress(indeterminate=True)
         self.status_lbl.configure(text="Logging in and scanning 999.md…")
 
@@ -613,7 +719,7 @@ class App999(ctk.CTk):
         finally:
             self.after(0, self._hide_progress)
             self.after(0, lambda: self.refresh_btn.configure(
-                state="normal", text="⟳  Refresh"))
+                state="normal", text="Refresh"))
 
     def _on_listings_loaded(self, listings: list, from_cache: bool = False):
         self.listings = listings
@@ -708,11 +814,13 @@ class App999(ctk.CTk):
     def _toggle_console(self):
         if self.console_frame.winfo_ismapped():
             self.console_frame.pack_forget()
-            self.console_btn.configure(text="Console ▼")
+            self.console_btn.configure(text="Console",
+                                       border_color=(_DIVIDER, _DIVIDER))
         else:
-            self.console_frame.pack(fill="x", padx=8, pady=(0, 4),
+            self.console_frame.pack(fill="x", padx=6, pady=(0, 4),
                                     before=self._bot)
-            self.console_btn.configure(text="Console ▲")
+            self.console_btn.configure(text="Console",
+                                       border_color=(_ACCENT, _ACCENT))
 
     # ── Progress bar helpers ──────────────────────────────────────────────────
     def _show_progress(self, indeterminate: bool = False):
