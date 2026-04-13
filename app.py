@@ -113,14 +113,30 @@ async def scrape_account(acc: dict, max_active: int = 30,
 
         ad_urls: list[str] = []
 
-        for tab, tab_param in (("active", "active"), ("inactive", "not-active")):
+        cabinet_url = f"{core.BASE_URL}/ro/cabinet/items/{acc['username']}"
+        await page.goto(cabinet_url, wait_until="domcontentloaded")
+        await page.wait_for_timeout(1500)
+
+        for tab, tab_testid in (
+            ("active",   "ads-cabinet-tab-active"),
+            ("inactive", "ads-cabinet-tab-not-active"),
+        ):
             tab_limit = max_active if tab == "active" else max_inactive
             tab_count = 0
 
             print(f"  Collecting {tab} listings (up to {tab_limit})…")
-            url = f"{core.BASE_URL}/ro/cabinet/items/{acc['username']}?tab={tab_param}"
-            await page.goto(url, wait_until="domcontentloaded")
-            await page.wait_for_timeout(1500)
+            # Click the tab button so JS routing shows the correct listings
+            try:
+                btn = page.locator(f"[data-testid='{tab_testid}']").first
+                if await btn.is_visible(timeout=3000):
+                    await btn.click()
+                    await page.wait_for_timeout(1500)
+                else:
+                    print(f"  [WARN] Tab button '{tab_testid}' not visible, skipping")
+                    continue
+            except Exception as e:
+                print(f"  [WARN] Could not click tab '{tab_testid}': {e}")
+                continue
 
             while tab_count < tab_limit:
                 found_on_page = 0
