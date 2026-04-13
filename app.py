@@ -117,6 +117,13 @@ async def scrape_account(acc: dict, max_active: int = 30,
         await page.goto(cabinet_url, wait_until="domcontentloaded")
         await page.wait_for_timeout(1500)
 
+        # Dismiss IntroJS tour overlay if present (blocks all clicks)
+        await page.evaluate("""() => {
+            document.querySelectorAll(
+                '.introjs-overlay, .introjs-tour, .introjs-helperLayer'
+            ).forEach(el => el.remove());
+        }""")
+
         for tab, tab_testid in (
             ("active",   "ads-cabinet-tab-active"),
             ("inactive", "ads-cabinet-tab-not-active"),
@@ -125,19 +132,21 @@ async def scrape_account(acc: dict, max_active: int = 30,
             tab_count = 0
 
             print(f"  Collecting {tab} listings (up to {tab_limit})…")
-            # Click the tab button so JS routing shows the correct listings
-            try:
-                btn = page.locator(f"[data-testid='{tab_testid}']").first
-                if await btn.is_visible(timeout=3000):
-                    await btn.click()
-                    await page.wait_for_load_state("networkidle")
-                    await page.wait_for_timeout(1000)
-                else:
-                    print(f"  [WARN] Tab button '{tab_testid}' not visible, skipping")
+            # For active tab the page already shows active listings by default,
+            # so skip the click; for other tabs, click the tab button.
+            if tab != "active":
+                try:
+                    btn = page.locator(f"[data-testid='{tab_testid}']").first
+                    if await btn.is_visible(timeout=3000):
+                        await btn.click()
+                        await page.wait_for_load_state("networkidle")
+                        await page.wait_for_timeout(1000)
+                    else:
+                        print(f"  [WARN] Tab button '{tab_testid}' not visible, skipping")
+                        continue
+                except Exception as e:
+                    print(f"  [WARN] Could not click tab '{tab_testid}': {e}")
                     continue
-            except Exception as e:
-                print(f"  [WARN] Could not click tab '{tab_testid}': {e}")
-                continue
 
             print(f"  Tab URL: {page.url}")
 
