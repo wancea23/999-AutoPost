@@ -144,6 +144,50 @@ async def login(page):
     await ensure_new_design(page)
 
 
+# ── Expand collapsed sections ────────────────────────────────────────────────
+async def expand_collapsibles(page):
+    """
+    Click "Citește tot" / "Afișează totul" expanders so the full description
+    and feature lists are mounted before we scrape. On 999.md the "Citește
+    tot" trigger is rendered as a <label> (not a button) tied to a hidden
+    checkbox via styles_description__button, so we include `label` selectors.
+    """
+    texts = [
+        "Citește tot", "Citeste tot",
+        "Citește mai mult", "Citeste mai mult",
+        "Afișează totul", "Afiseaza totul",
+        "Afișează tot", "Afiseaza tot",
+        "Vezi totul", "Vezi tot",
+        "Показать всё", "Показать все", "Читать далее", "Подробнее",
+        "Show all", "Show more", "Read more",
+    ]
+    for _ in range(2):
+        clicked_any = False
+        for txt in texts:
+            try:
+                loc = page.locator(
+                    f"button:has-text('{txt}'), a:has-text('{txt}'), "
+                    f"label:has-text('{txt}'), span:has-text('{txt}'), "
+                    f"div[role='button']:has-text('{txt}')"
+                )
+                count = await loc.count()
+                for i in range(count):
+                    try:
+                        el = loc.nth(i)
+                        if await el.is_visible(timeout=200):
+                            await el.scroll_into_view_if_needed(timeout=500)
+                            await el.click(timeout=1000)
+                            clicked_any = True
+                            await page.wait_for_timeout(250)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        if not clicked_any:
+            break
+        await page.wait_for_timeout(400)
+
+
 # ── Scrape listing detail ─────────────────────────────────────────────────────
 async def scrape_listing_detail(page, url: str, client: httpx.AsyncClient) -> dict:
     """Scrape a single listing page (new 999.md design) and return a dict."""
@@ -152,58 +196,89 @@ async def scrape_listing_detail(page, url: str, client: httpx.AsyncClient) -> di
     await page.goto(clean_url, wait_until="domcontentloaded")
     await page.wait_for_timeout(1500)
 
+    # Scroll to the bottom once to trigger lazy-loaded sections, then expand
+    # every "Citește tot" / "Afișează totul" so the full text and checkbox
+    # lists are mounted before we read them.
+    try:
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await page.wait_for_timeout(600)
+        await page.evaluate("window.scrollTo(0, 0)")
+        await page.wait_for_timeout(300)
+    except Exception:
+        pass
+    await expand_collapsibles(page)
+
     listing = {"url": clean_url}
 
     # Extract everything via JavaScript — avoids CSS visibility issues
     extracted = await page.evaluate("""() => {
-        // Title: try h1, then h2, then any element with 'title' in class
+        // Title — on 999.md detail pages the real title is in <h2>; the
+        // <h1> is an empty `introjs-tooltip-title` placeholder. Try h2 first.
         let title = '';
-        for (const sel of ['h1', 'h2', '[class*="title"]']) {
+        for (const sel of ['h2', 'h1', '[class*="title"]']) {
             const el = document.querySelector(sel);
             if (el && el.innerText.trim()) { title = el.innerText.trim(); break; }
         }
 
-        // Price: anchor search near the <h1> title so we never pick up prices
-        // from "similar listings" widgets or market-value estimates that appear
-        // earlier in the DOM than the actual listing price.
+        // Price: the listing detail page has exactly one element with class
+        // matching `price__main` — that's the headline price. Every other
+        // price on the page (`price__text`, `oldprice`, `price__component`)
+        // belongs to the similar-listings strip below. Verified live on
+        // 999.md/ro new design 2026-05-14.
         let price = '';
-        const priceRe = /\d[\d\s\xa0]*(?:MDL|€|\$|lei)/i;
-        const h1 = document.querySelector('h1');
-        if (h1) {
-            // Walk UP from h1 up to 6 levels; find the nearest ancestor that
-            // also contains a price element — that ancestor is the listing header.
-            let container = h1.parentElement;
-            for (let i = 0; i < 6 && container; i++, container = container.parentElement) {
-                for (const sel of [
-                    '[data-testid="price"]', '[data-testid*="price"]',
-                    '[class*="price__value"]', '[class*="PriceBlock"]',
-                    '[class*="price-block"]', '[class*="Price"]', '[class*="price"]',
-                ]) {
-                    const el = container.querySelector(sel);
-                    if (!el || el === container) continue;
-                    const t = (el.innerText || '').trim();
-                    if (t && t.length < 40 && priceRe.test(t)) { price = t; break; }
-                }
-                if (price) break;
-            }
-        }
-        // Fallback: first price-like string anywhere on the page
+        const priceMain = document.querySelector('[class*="price__main"]');
+        if (priceMain) price = (priceMain.innerText || '').trim();
+        // Fallback for non-car listings if `price__main` is missing.
         if (!price) {
-            for (const sel of ['[class*="Price"]', '[class*="price"]']) {
-                for (const el of document.querySelectorAll(sel)) {
-                    const t = (el.innerText || '').trim();
-                    if (t && t.length < 40 && priceRe.test(t)) { price = t; break; }
-                }
-                if (price) break;
+            const priceRe = /\d[\d\s\xa0\.,]*\s*(?:MDL|€|EUR|\$|USD|lei)/i;
+            for (const el of document.querySelectorAll(
+                '[class*="price__value"], [class*="Price__value"], ' +
+                '[class*="price-block"], [class*="PriceBlock"]'
+            )) {
+                const t = (el.innerText || '').trim();
+                if (t && t.length < 60 && priceRe.test(t)) { price = t; break; }
             }
         }
 
-        // Description
+        // Currency detection — repost form needs to flip the currency toggle.
+        let currency = '';
+        if (/€|EUR/i.test(price))      currency = 'EUR';
+        else if (/\$|USD/i.test(price)) currency = 'USD';
+        else if (/MDL|lei/i.test(price)) currency = 'MDL';
+
+        // Description — the wrapper `[itemprop="description"]` contains both
+        // the body and the "Citește tot" <label>, so its innerText ends with
+        // "Citește tot". Use the inner `description__body` element instead
+        // (and the JSON-LD product description as a last-resort fallback).
+        // Strip any stray "Citește tot" / "Citește mai mult" lines just in
+        // case 999.md rearranges the DOM.
         let desc = '';
-        for (const sel of ['[data-testid="advert-description"]','[class*="description__text"]','[class*="description"]']) {
-            const el = document.querySelector(sel);
-            if (el && el.innerText.trim()) { desc = el.innerText.trim(); break; }
+        const descBody = document.querySelector('[class*="description__body"]');
+        if (descBody && descBody.innerText.trim()) {
+            desc = descBody.innerText.trim();
+        } else {
+            for (const sel of ['[data-testid="advert-description"]',
+                               '[class*="description__text"]',
+                               '[itemprop="description"]']) {
+                const el = document.querySelector(sel);
+                if (el && el.innerText.trim()) { desc = el.innerText.trim(); break; }
+            }
+            // Final fallback: JSON-LD Product.description
+            if (!desc) {
+                for (const s of document.querySelectorAll('script[type="application/ld+json"]')) {
+                    try {
+                        const j = JSON.parse(s.textContent);
+                        const d = j.description ||
+                                  (j['@graph'] && j['@graph'][0] && j['@graph'][0].description);
+                        if (d) { desc = String(d).trim(); break; }
+                    } catch (e) {}
+                }
+            }
         }
+        desc = desc.replace(
+            /\\n?\\s*(Cite[șs]te (tot|mai mult)|Citește tot|Show more|Read more|Показать всё|Подробнее)\\s*$/i,
+            ''
+        ).trim();
 
         // Breadcrumb
         const crumbEls = document.querySelectorAll(
@@ -213,33 +288,52 @@ async def scrape_listing_detail(page, url: str, client: httpx.AsyncClient) -> di
         const crumbLinks = Array.from(crumbEls).map(e => e.getAttribute('href') || '');
         const categoryHref = [...crumbLinks].reverse().find(h => h.includes('/category/') || h.includes('/list/')) || '';
 
-        // Attributes — features section uses CSS accordion, read innerText directly
+        // Attributes — `[class*="features"] [data-testid="<GroupName>"]`
+        // wraps each feature group. Inside each group every <li> is one
+        // feature row:
+        //   • 3 children → key/value pair (icon + label + value)
+        //   • 2 children → checkbox feature (checkmark + label only)
+        // We discriminate per-row instead of per-group because cars mix both
+        // (Securitate has only checkboxes, Particularități only k/v, but
+        // hybrid groups exist in other categories). Verified live 2026-05-14.
         const attrs = {};
+        const feature_lists = {};
         const featuresEl = document.querySelector('[class*="features"]');
         if (featuresEl) {
-            const groups = featuresEl.querySelectorAll('[data-testid]');
-            groups.forEach(group => {
-                const lines = group.innerText
-                    .split('\\n')
-                    .map(l => l.trim())
-                    .filter(l => l);
-                // lines[0] = group header, then key/value pairs
-                for (let i = 1; i + 1 < lines.length; i += 2) {
-                    attrs[lines[i]] = lines[i + 1];
+            featuresEl.querySelectorAll('[data-testid]').forEach(group => {
+                const groupName = group.getAttribute('data-testid') || '';
+                const liItems = group.querySelectorAll('li');
+                const checkboxItems = [];
+                liItems.forEach(li => {
+                    const parts = (li.innerText || '').split('\\n')
+                        .map(s => s.trim()).filter(Boolean);
+                    if (parts.length === 2) {
+                        attrs[parts[0]] = parts[1];
+                    } else if (parts.length === 1) {
+                        checkboxItems.push(parts[0]);
+                    }
+                });
+                if (checkboxItems.length) {
+                    feature_lists[groupName] = Array.from(new Set(checkboxItems));
                 }
             });
         }
 
-        return { title, price, desc, crumbs, categoryHref, attrs };
+        return { title, price, currency, desc, crumbs, categoryHref, attrs, feature_lists };
     }""")
 
     listing["title"] = extracted.get("title", "")
     listing["price"] = extracted.get("price", "")
+    listing["currency"] = extracted.get("currency", "")
     listing["description"] = extracted.get("desc", "")
     listing["category_breadcrumb"] = extracted.get("crumbs", [])
     listing["category_url"] = extracted.get("categoryHref", "")
     listing["attributes"] = extracted.get("attrs", {})
-    print(f"    title={listing['title']!r}  price={listing['price']!r}  attrs={len(listing['attributes'])}")
+    listing["feature_lists"] = extracted.get("feature_lists", {})
+    feat_count = sum(len(v) for v in listing["feature_lists"].values())
+    print(f"    title={listing['title']!r}  price={listing['price']!r}  "
+          f"cur={listing['currency']!r}  attrs={len(listing['attributes'])}  "
+          f"features={feat_count}")
 
     # ── Photos ───────────────────────────────────────────────────────────────
     photo_urls = []
@@ -375,151 +469,375 @@ async def fill_input(page, placeholder: str, value: str) -> bool:
 
 async def fill_dropdown(page, label_text: str, value: str) -> bool:
     """
-    Fill a custom React dropdown/combobox by its label text.
-    Finds all 'Selectează' triggers on the page — checking both innerText
-    (div-based dropdowns) AND placeholder attribute (input-based comboboxes) —
-    then picks the one whose screen centre is closest to the label.
-    Clicks via page.mouse.click() so React synthetic events fire correctly.
+    Fill a 999.md React combobox by its label text. Verified live 2026-05-14.
+
+    Every dropdown on the new add form has the same structure:
+        <div class="styles_field__row__86QTX …">
+          <div class="styles_field__row__title__9wh0D">
+            <span class="styles_title__name__vu2nT">{LABEL}</span>
+          </div>
+          <input data-testid="{N}-input"        aria-haspopup="listbox"
+                 placeholder="Selectează"       value="">
+          <input data-testid="{N}-hidden-input" type="hidden">
+        </div>
+
+    Strategy:
+      1. Find the title span with EXACT label text + `title__name` class
+         (so "Tip" doesn't ambiguously match "Tip combustibil", and the
+         label-only `field__row__title` container is distinguishable from
+         the input container).
+      2. Walk up to the surrounding `field__row__86QTX` container.
+      3. Click `input[data-testid$="-input"]` inside that container — this
+         opens a `<div role="listbox" id="{N}">` of `[role="option"]`s.
+      4. Poll up to 4 s (dependent dropdowns like Tip take a moment to
+         populate after their parent field is selected) then click the
+         option whose text equals (or contains) the value.
     """
     if not value:
         return False
     value = str(value).strip()
     safe_label = label_text.replace("'", "\\'")
 
-    result = await page.evaluate(f"""() => {{
+    # ── 1+2: Locate the field & decide whether it's a listbox or a value
+    # input. Two field shapes exist on the new add form:
+    #   • listbox combobox  → `<input data-testid="620-input" aria-haspopup="listbox" …>`
+    #   • numeric/free text → `<input id="N.value" placeholder="Introdu valoarea" …>`
+    #                         often with a sibling `<button data-testid="N.unit">km|€|…</button>`
+    info = await page.evaluate(f"""() => {{
         const labelText = '{safe_label}';
+        // Source listings render labels like "Putere" while the add form
+        // bakes the unit into the label ("Putere, CP"). Accept the first
+        // exact match if any; otherwise fall back to a prefix match such
+        // that "Putere" matches "Putere, CP" or "Putere CP".
+        let exact = null, prefix = null;
+        for (const sp of document.querySelectorAll('span')) {{
+            if (!(sp.className || '').toString().includes('title__name')) continue;
+            const r = sp.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) continue;
+            const t = (sp.innerText || '').trim().replace(/\\s*\\*$/, '').trim();
+            if (t === labelText) {{ exact = sp; break; }}
+            if (!prefix && (t.startsWith(labelText + ',') ||
+                            t.startsWith(labelText + ' '))) {{
+                prefix = sp;
+            }}
+        }}
+        const title = exact || prefix;
+        if (!title) return {{ error: 'label_not_found' }};
+        // Walk up to the field container (NOT the title-only container)
+        let row = title;
+        for (let i = 0; i < 10; i++) {{
+            row = row.parentElement;
+            if (!row) break;
+            const cls = (row.className || '').toString();
+            if (cls.includes('field__row__86QTX') ||
+                (cls.includes('field__row') && !cls.includes('field__row__title'))) break;
+        }}
+        if (!row) return {{ error: 'no_field_row' }};
 
-        // ── 1. Locate the label element (any tag) ────────────────────────────
-        let labelRect = null;
-        for (const el of document.querySelectorAll(
-            'label, span, div, p, td, dt, b, strong, h4, h5, h6'
-        )) {{
-            const t = (el.innerText || '').trim().replace(/\\s*\\*$/, '').trim();
-            if (t !== labelText) continue;
-            const r = el.getBoundingClientRect();
-            if (r.width === 0 || r.width > 500 || r.height > 100) continue;
-            labelRect = r;
-            break;
+        // 1. Listbox combobox?
+        const combo = row.querySelector(
+            'input[aria-haspopup="listbox"][data-testid$="-input"]:not([type="hidden"])'
+        );
+        if (combo) {{
+            return {{
+                kind: 'listbox',
+                testid: combo.getAttribute('data-testid'),
+                currentValue: combo.value || '',
+            }};
         }}
 
-        if (!labelRect) {{
-            // Debug: collect short visible text snippets from the page
-            const dbg = Array.from(document.querySelectorAll('label, span, div'))
-                .filter(el => {{
-                    const t = (el.innerText || '').trim();
-                    const r = el.getBoundingClientRect();
-                    return t.length > 0 && t.length < 40 && r.width > 0 &&
-                           r.width < 400 && r.height < 60;
-                }})
-                .map(el => (el.innerText || '').trim().replace(/\\s*\\*$/, ''))
-                .filter(Boolean).slice(0, 25);
-            return {{ error: 'label_not_found', dbg }};
+        // 2. Plain value input?  Match `id$=".value"` first (price/rulaj/putere
+        //    use this canonical form), then fall back to placeholder match.
+        let val = row.querySelector('input[id$=".value"]:not([type="hidden"])');
+        if (!val) {{
+            val = row.querySelector(
+                'input[placeholder*="valoarea" i]:not([type="hidden"]), ' +
+                'input[placeholder*="Introdu" i]:not([type="hidden"])'
+            );
         }}
-
-        const labelCY = labelRect.top  + labelRect.height / 2;
-        const labelCX = labelRect.left + labelRect.width  / 2;
-
-        // ── 2. Collect every "Selectează" trigger on the page ─────────────────
-        // Check BOTH innerText (div dropdowns) and placeholder attr (input comboboxes)
-        const seen = new Set();
-        const triggers = [];
-        for (const el of document.querySelectorAll(
-            'div, button, span, input, [role="combobox"], [role="listbox"]'
-        )) {{
-            if (seen.has(el)) continue;
-            seen.add(el);
-            const inner = (el.innerText || '').trim();
-            const ph    = (el.getAttribute('placeholder') || '').trim();
-            const txt   = inner || ph;
-            if (!txt.includes('Selectea')) continue;
-            const r = el.getBoundingClientRect();
-            if (r.width < 40 || r.height < 10 || r.width > 900) continue;
-            if (r.top < -200) continue;
-            const dist = Math.abs((r.top + r.height/2) - labelCY)
-                       + Math.abs((r.left + r.width/2) - labelCX) * 0.3;
-            triggers.push({{ el, r, dist, area: r.width * r.height,
-                             isInput: el.tagName === 'INPUT' }});
+        if (val) {{
+            const unitBtn = row.querySelector('button[data-testid$=".unit"]');
+            return {{
+                kind: 'value',
+                id: val.id || '',
+                placeholder: val.getAttribute('placeholder') || '',
+                currentValue: val.value || '',
+                unit_testid: unitBtn ? unitBtn.getAttribute('data-testid') : '',
+                unit_text: unitBtn ? (unitBtn.innerText || '').trim() : '',
+            }};
         }}
-
-        if (!triggers.length) {{
-            return {{ error: 'no_triggers', labelY: labelRect.top }};
-        }}
-
-        // Sort: closest first; break ties by smallest area (most specific element)
-        triggers.sort((a, b) => {{
-            if (Math.abs(a.dist - b.dist) > 5) return a.dist - b.dist;
-            return a.area - b.area;
-        }});
-
-        const best = triggers[0];
-        return {{
-            x: best.r.left + best.r.width  / 2,
-            y: best.r.top  + best.r.height / 2,
-            isInput: best.isInput,
-            dist: Math.round(best.dist),
-            total: triggers.length,
-        }};
+        return {{ error: 'no_input' }};
     }}""")
 
-    if not result or result.get("error"):
-        err = (result or {}).get("error", "null")
-        print(f"      [DBG] '{label_text}': {err}")
-        if err == "label_not_found":
-            print(f"             candidates: {(result or {}).get('dbg', [])}")
+    if not info or info.get("error"):
+        print(f"      [DBG] '{label_text}': {(info or {}).get('error', 'null')}")
         return False
 
-    # Real mouse click — fires React's synthetic event system
-    await page.mouse.click(result["x"], result["y"])
-    await page.wait_for_timeout(700)
+    # ── Value-input branch: fill the field, optionally adjust the unit ─────
+    if info.get("kind") == "value":
+        # Decide whether the field is numeric-with-unit (Rulaj "142000 km",
+        # Putere "131 CP", Motor "1.5 l") or free-form text (VIN code, license
+        # plates, custom strings). We only strip non-digits in the first case
+        # — otherwise valid VINs like "JT2EL55D9N40020463" get mangled to
+        # "20020463" and the form rejects them as "Valoare neacceptată".
+        unit_testid = info.get("unit_testid", "")
+        looks_numeric = bool(re.match(
+            r"^\s*-?\d[\d\s.,]*(\s*[A-Za-zА-Яа-я%/³²]+)?\s*$", value
+        ))
+        if unit_testid or looks_numeric:
+            fill_value = re.sub(r"[^\d.,]", "", value).strip().rstrip(".,")
+            if not fill_value:
+                print(f"      [DBG] '{label_text}': no digits in {value!r}")
+                return False
+        else:
+            fill_value = value
 
-    safe_value = value.replace("'", "\\'")
+        # Prefer id-based selector — IDs are stable; placeholders aren't.
+        if info.get("id"):
+            val_sel = f'input[id="{info["id"]}"]'
+        else:
+            ph = info.get("placeholder", "Introdu valoarea").replace('"', '\\"')
+            val_sel = f'input[placeholder="{ph}"]'
+        try:
+            await page.locator(val_sel).first.fill(fill_value, timeout=2000)
+        except Exception as e:
+            print(f"      [DBG] '{label_text}': fill failed: {e}")
+            return False
 
-    # All option selectors — covers li-based, role-based, class-based,
-    # AND plain div/span options (common on 999.md, e.g. Stare: "Nou"/"Uzat").
-    # :text-is() matches exact visible text only, not parent containers.
+        # If there's a unit toggle and the scraped value names a different
+        # unit than what's currently set, flip it. Light-touch: only act
+        # when we can confidently map the value's unit text.
+        unit_testid = info.get("unit_testid", "")
+        if unit_testid:
+            lv = value.lower()
+            target = None
+            if   "mi" in lv and "km" not in lv: target = "mi"
+            elif "km" in lv:                    target = "km"
+            elif "€" in value or "eur" in lv:   target = "€"
+            elif "$" in value or "usd" in lv:   target = "$"
+            elif "mdl" in lv or "lei" in lv:    target = "MDL"
+            current = (info.get("unit_text") or "").strip()
+            if target and target.lower() != current.lower():
+                try:
+                    await page.locator(f'button[data-testid="{unit_testid}"]').click(timeout=1500)
+                    await page.wait_for_timeout(300)
+                    await page.locator(
+                        f'[role="option"]:text-is("{target}")'
+                    ).first.click(timeout=1500)
+                    await page.wait_for_timeout(200)
+                except Exception:
+                    pass
+        return True
+
+    # ── Listbox branch ──────────────────────────────────────────────────────
+    testid = info["testid"]                       # e.g. "620-input"
+    listbox_id = testid.rsplit("-", 1)[0]         # e.g. "620"
+
+    # If the combobox already shows the desired value, skip clicking.
+    if info["currentValue"].strip().lower() == value.lower():
+        return True
+
+    input_sel = f'input[data-testid="{testid}"]'
+
+    # ── 3: Open the dropdown ──────────────────────────────────────────────────
+    try:
+        trigger = page.locator(input_sel).first
+        await trigger.scroll_into_view_if_needed(timeout=1500)
+        await trigger.click(timeout=2000)
+    except Exception as e:
+        print(f"      [DBG] '{label_text}': click trigger failed: {e}")
+        return False
+
+    # ── 4: Wait for the listbox + click the matching option ──────────────────
+    safe_value = value.replace("'", "\\'").replace('"', '\\"')
+    listbox_sel = f'#{listbox_id}[role="listbox"]'
     opt_sels = [
-        f"li:has-text('{safe_value}')",
-        f"[role='option']:has-text('{safe_value}')",
-        f"[class*='option']:has-text('{safe_value}')",
-        f"[class*='item']:has-text('{safe_value}')",
-        f"div:text-is('{safe_value}')",
-        f"span:text-is('{safe_value}')",
+        f'{listbox_sel} [role="option"]:text-is("{safe_value}")',
+        f'{listbox_sel} [role="option"]:has-text("{safe_value}")',
+        # Fallback: any visible option (handles dropdowns whose listbox id
+        # changes between open/close, e.g. when React remounts).
+        f'[role="option"]:text-is("{safe_value}"):visible',
+        f'[role="option"]:has-text("{safe_value}"):visible',
     ]
 
-    # Poll up to 3 seconds for options to appear.
-    # This handles both normal dropdowns (fast) and dependent dropdowns like
-    # "Tip" which only populate after a parent field (Fel) finishes updating.
-    opts_visible = False
-    for _ in range(6):  # 6 × 500ms = 3s max
-        for opt_sel in opt_sels:
+    for _ in range(8):  # up to ~4 s — covers slow dependent dropdowns
+        for sel in opt_sels:
             try:
-                if await page.locator(opt_sel).first.is_visible(timeout=400):
-                    opts_visible = True
-                    break
+                opt = page.locator(sel).first
+                if await opt.is_visible(timeout=300):
+                    await opt.click(timeout=1500)
+                    await page.wait_for_timeout(250)
+                    return True
             except Exception:
                 pass
-        if opts_visible:
-            break
         await page.wait_for_timeout(500)
 
-    # If still nothing, try typing (combobox / autocomplete path, e.g. Regiune)
-    if not opts_visible:
-        await page.keyboard.type(value[:5])
+    # Last-resort: try typing into the combobox (Regiune autocompletes this way)
+    try:
+        await page.locator(input_sel).first.fill(value[:8])
         await page.wait_for_timeout(700)
+        for sel in opt_sels:
+            try:
+                opt = page.locator(sel).first
+                if await opt.is_visible(timeout=400):
+                    await opt.click(timeout=1500)
+                    await page.wait_for_timeout(250)
+                    return True
+            except Exception:
+                pass
+    except Exception:
+        pass
 
-    # Click the matching option
-    for opt_sel in opt_sels:
+    try:
+        await page.keyboard.press("Escape")
+    except Exception:
+        pass
+    return False
+
+
+# ── Currency toggle (€ | MDL | $) ────────────────────────────────────────────
+async def select_currency(page, currency: str) -> bool:
+    """
+    Click the currency unit trigger that sits next to the price input and
+    pick the matching option. The price's unit trigger is the first
+    `button[data-testid$=".unit"][aria-haspopup="listbox"]` in the form
+    DOM order (verified live 2026-05-14 — other `.unit` triggers like
+    "Prima rată" / "Rulaj" come later in the page).
+    """
+    symbol = {"EUR": "€", "USD": "$", "MDL": "MDL"}.get(currency.upper())
+    if not symbol:
+        return False
+
+    # Locate the price field's unit trigger via the JS helper used by
+    # fill_dropdown — anchor to the "Preț" title span, walk up to the
+    # field row, look for the `.unit` button inside.
+    testid = await page.evaluate("""() => {
+        let title = null;
+        for (const sp of document.querySelectorAll('span')) {
+            const t = (sp.innerText || '').trim().replace(/\\s*\\*$/, '').trim();
+            if (t !== 'Preț') continue;
+            if (!(sp.className || '').toString().includes('title__name')) continue;
+            title = sp;
+            break;
+        }
+        if (!title) return null;
+        let row = title;
+        for (let i = 0; i < 10; i++) {
+            row = row.parentElement;
+            if (!row) break;
+            const cls = (row.className || '').toString();
+            if (cls.includes('field__row__86QTX') ||
+                (cls.includes('field__row') && !cls.includes('field__row__title'))) break;
+        }
+        if (!row) return null;
+        const btn = row.querySelector('button[data-testid$=".unit"][aria-haspopup="listbox"]');
+        return btn ? btn.getAttribute('data-testid') : null;
+    }""")
+
+    if not testid:
+        # Fallback: first unit trigger on the page (price is first in DOM).
+        testid_sel = 'button[data-testid$=".unit"][aria-haspopup="listbox"]'
+    else:
+        testid_sel = f'button[data-testid="{testid}"]'
+
+    try:
+        trigger = page.locator(testid_sel).first
+        await trigger.scroll_into_view_if_needed(timeout=1500)
+        await trigger.click(timeout=2000)
+    except Exception:
+        return False
+
+    await page.wait_for_timeout(350)
+    safe = symbol.replace("'", "\\'")
+    for sel in (
+        f'[role="option"]:text-is("{safe}")',
+        f'[role="option"]:has-text("{safe}")',
+    ):
         try:
-            opt = page.locator(opt_sel).first
-            if await opt.is_visible(timeout=1500):
-                await opt.click()
-                await page.wait_for_timeout(400)
+            opt = page.locator(sel).first
+            if await opt.is_visible(timeout=600):
+                await opt.click(timeout=2000)
+                await page.wait_for_timeout(200)
                 return True
         except Exception:
             pass
 
-    await page.keyboard.press("Escape")
+    try:
+        await page.keyboard.press("Escape")
+    except Exception:
+        pass
     return False
+
+
+# ── Tick a single feature checkbox by its label text ──────────────────────────
+async def tick_checkbox(page, label: str) -> bool:
+    """
+    Tick a boolean feature checkbox by its visible label. On the new add
+    form each checkbox is rendered as:
+        <label class="…feature__boolean__label__…"><input type=checkbox> Text</label>
+    Verified live on the cars add form 2026-05-14 (53 checkboxes, all in DOM).
+    Skips items that are already ticked.
+    """
+    if not label:
+        return False
+    safe = label.replace("'", "\\'").replace('"', '\\"')
+    sels = [
+        f'label[class*="boolean__label"]:has-text("{safe}")',
+        f'label[class*="checkbox__container"]:has-text("{safe}")',
+        f'label:text-is("{safe}")',
+    ]
+    for sel in sels:
+        try:
+            el = page.locator(sel).first
+            if not await el.is_visible(timeout=300):
+                continue
+            # If the inner checkbox is already checked, skip.
+            try:
+                cb = el.locator('input[type="checkbox"]').first
+                if await cb.is_checked():
+                    return True
+            except Exception:
+                pass
+            try:
+                await el.scroll_into_view_if_needed(timeout=500)
+            except Exception:
+                pass
+            await el.click(timeout=1500)
+            await page.wait_for_timeout(80)
+            return True
+        except Exception:
+            pass
+    return False
+
+
+# ── License-plate hiding modal (cars) ─────────────────────────────────────────
+async def dismiss_plate_modal(page) -> None:
+    """
+    After photo upload on a car listing, 999.md pops a modal asking whether
+    to blur visible licence plates. The user wants plates kept visible, so
+    we click any "Nu" button inside the dialog. Silent no-op otherwise.
+    """
+    end = asyncio.get_event_loop().time() + 7.0
+    while asyncio.get_event_loop().time() < end:
+        for sel in [
+            "[role='dialog'] button:has-text('Nu')",
+            "[role='dialog'] button:text-is('Nu')",
+            "[class*='modal' i] button:has-text('Nu')",
+            "button:has-text('Nu, păstrează')",
+            "button:has-text('Nu, pastreaza')",
+            "button:text-is('Nu')",
+            "[role='dialog'] button:text-is('Нет')",
+        ]:
+            try:
+                btn = page.locator(sel).first
+                if await btn.is_visible(timeout=300):
+                    await btn.click(timeout=1000)
+                    print("    Declined licence-plate blur prompt.")
+                    await page.wait_for_timeout(400)
+                    return
+            except Exception:
+                pass
+        await page.wait_for_timeout(400)
 
 
 # ── Repost command ────────────────────────────────────────────────────────────
@@ -549,6 +867,11 @@ async def repost_listing(page, listing: dict) -> dict:
 
     await page.goto(add_url, wait_until="domcontentloaded")
     await page.wait_for_timeout(2000)
+
+    # Some categories (esp. transport/cars) hide most of their checkbox
+    # features behind an "Afișează totul" / "Mai multe" expander on the add
+    # form. Click it before we start filling so the targets exist in the DOM.
+    await expand_collapsibles(page)
 
     log_entry = {
         "original_url": listing.get("url", ""),
@@ -582,6 +905,12 @@ async def repost_listing(page, listing: dict) -> dict:
         ok = await fill_input(page, "Introdu prețul", price_num)
         print(f"    Preț={price_num!r} → {'✓' if ok else '✗'}")
 
+        # ── Currency (€ / MDL / $ toggle next to the price) ─────────────────
+        currency = (listing.get("currency") or "").upper()
+        if currency:
+            cur_clicked = await select_currency(page, currency)
+            print(f"    Currency={currency} → {'✓' if cur_clicked else '✗'}")
+
         # ── Characteristics ──────────────────────────────────────────────────
         attrs = listing.get("attributes", {})
         for attr_key, attr_val in attrs.items():
@@ -590,6 +919,16 @@ async def repost_listing(page, listing: dict) -> dict:
             else:
                 ok = await fill_dropdown(page, attr_key, attr_val)
             print(f"    {attr_key}={attr_val!r} → {'✓' if ok else '✗'}")
+
+        # ── Checkbox feature lists (Dotări, etc.) ────────────────────────────
+        feat_lists = listing.get("feature_lists", {}) or {}
+        if feat_lists:
+            # Ensure any "Afișează totul" inside characteristic sections is open
+            await expand_collapsibles(page)
+        for group_name, items in feat_lists.items():
+            for item in items:
+                ticked = await tick_checkbox(page, item)
+                print(f"    [{group_name}] {item!r} → {'✓' if ticked else '✗'}")
 
         # ── Titles (RO + RU both required) ───────────────────────────────────
         title_inputs = await page.query_selector_all(
@@ -603,6 +942,16 @@ async def repost_listing(page, listing: dict) -> dict:
         # ── Description (RO + RU textareas) ──────────────────────────────────
         desc = listing.get("description", "")
         if desc:
+            # Defensive strip — older listings.json caches (scraped before
+            # we anchored to `description__body`) end with the trailing
+            # "Citește tot" expander label baked into the description text.
+            desc = re.sub(
+                r"\n?\s*(Cite[șs]te\s+(tot|mai\s+mult)|Show\s+more|Read\s+more|"
+                r"Показать\s+(всё|все)|Подробнее|Читать\s+далее)\s*$",
+                "",
+                desc,
+                flags=re.IGNORECASE,
+            ).rstrip()
             desc_areas = await page.query_selector_all(
                 "textarea[placeholder*='detalii'], textarea[placeholder*='Detalii']"
             )
@@ -621,12 +970,31 @@ async def repost_listing(page, listing: dict) -> dict:
             except Exception as e:
                 print(f"    [WARN] Photo upload failed: {e}")
 
+            # Car listings show a modal asking whether to blur the licence
+            # plates. We always decline (user wants the plates kept visible).
+            await dismiss_plate_modal(page)
+
         # ── Submit ───────────────────────────────────────────────────────────
         submit = page.locator(
             'button:has-text("Publică anunțul"), '
             'button:has-text("Publică"), '
+            'button:has-text("Continuați"), '
+            'button:has-text("Continuati"), '
             'button[type="submit"]'
         ).last
+
+        # If the final CTA is "Continuați", the form needs more wizard steps
+        # than we support — bail out instead of leaving a half-filled draft.
+        try:
+            btn_text = (await submit.inner_text()).strip()
+        except Exception:
+            btn_text = ""
+        if re.search(r"continua[țt]i", btn_text, re.I):
+            log_entry["status"] = "skipped_continuati"
+            log_entry["error"] = f"Submit button reads {btn_text!r} — multi-step form, skipped"
+            print(f"    [SKIP] Submit reads {btn_text!r}; skipping listing.")
+            return log_entry
+
         await submit.click()
         await page.wait_for_timeout(4000)
 
