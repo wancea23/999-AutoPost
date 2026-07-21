@@ -3,6 +3,7 @@
 Run: python app.py
 """
 import asyncio
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
 import io
 import json
@@ -243,6 +244,19 @@ async def repost_account(acc: dict, listings: list) -> list:
     core.EMAIL = acc["username"]
     core.PASSWORD = acc["password"]
 
+    log_path = DATA_DIR / acc["username"] / "repost_log.json"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        repost_log = json.loads(log_path.read_text(encoding="utf-8"))
+    except Exception:
+        repost_log = []
+
+    def _persist(entry: dict):
+        repost_log.append(entry)
+        log_path.write_text(
+            json.dumps(repost_log, ensure_ascii=False, indent=2),
+            encoding="utf-8")
+
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=core.HEADLESS)
         ctx = await browser.new_context(viewport={"width": 1280, "height": 900})
@@ -252,8 +266,21 @@ async def repost_account(acc: dict, listings: list) -> list:
 
         results = []
         for listing in listings:
-            result = await core.repost_listing(page, listing)
+            # One ad crashing (page closed, network drop) must not lose the
+            # log of what already happened, nor kill the remaining ads.
+            try:
+                result = await core.repost_listing(page, listing)
+            except Exception as e:
+                result = {
+                    "original_url": listing.get("url", ""),
+                    "title": listing.get("title", "Untitled"),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "status": "error",
+                    "new_url": "",
+                    "error": str(e),
+                }
             results.append(result)
+            _persist(result)
             await asyncio.sleep(2)
 
         await browser.close()
@@ -976,13 +1003,13 @@ class App999(ctk.CTk):
     async def _bg_repost(self, acc: dict, listings: list):
         try:
             results = await repost_account(acc, listings)
-            success = sum(1 for r in results
-                          if r.get("status") == "success")
-            self.after(0, lambda s=success, t=len(results):
-                       self._on_repost_done(s, t))
+            self.after(0, lambda r=results: self._on_repost_done(r))
         except Exception as e:
             self.after(0, lambda err=e: self.status_lbl.configure(
                 text=f"Repost error: {err}"))
+            self.after(0, lambda err=e: messagebox.showerror(
+                "Repost Failed",
+                f"The repost run could not start:\n\n{err}"))
         finally:
             self.after(0, self._hide_progress)
             self.after(0, lambda: self.repost_btn.configure(
@@ -991,12 +1018,46 @@ class App999(ctk.CTk):
                      f"({sum(1 for v in self.listing_vars if v.get())})"
             ))
 
-    def _on_repost_done(self, success: int, total: int):
-        self.status_lbl.configure(
-            text=f"Done: {success}/{total} reposted successfully.")
+    def _on_repost_done(self, results: list):
+        success = sum(1 for r in results if r.get("status") == "success")
+        # Paid categories (e.g. Autoturisme) are never paid for: known ones
+        # are skipped upfront; unexpected ones get their created ad deleted.
+        # Both end up as status "skipped_paid". "needs_payment" only remains
+        # if that automatic delete failed (ad sits in cabinet → Neachitate).
+        skipped_paid = sum(1 for r in results
+                           if r.get("status") == "skipped_paid")
+        needs_pay = sum(1 for r in results
+                        if r.get("status") == "needs_payment")
+        total = len(results)
+        summary = f"Done: {success}/{total} reposted successfully."
+        if skipped_paid:
+            summary += f" {skipped_paid} skipped (paid category)."
+        if needs_pay:
+            summary += f" {needs_pay} stuck unpaid in cabinet!"
+        self.status_lbl.configure(text=summary)
+
+        lines = []
+        for r in results:
+            title = (r.get("title") or "Untitled")[:60]
+            if r.get("status") == "success":
+                lines.append(f"[OK]  {title}")
+            elif r.get("status") == "skipped_paid":
+                lines.append(f"[SKIP]  {title}\n     → {r.get('error', '')}")
+            elif r.get("status") == "needs_payment":
+                lines.append(f"[PAY]  {title}\n     → {r.get('error', '')}")
+            else:
+                reason = r.get("error") or "form validation failed"
+                lines.append(f"[FAIL]  {title}\n     → {reason}")
+        detail = "\n".join(lines)
+        print("\n=== REPOST RESULTS ===\n" + detail + "\n")
         messagebox.showinfo(
             "Repost Complete",
-            f"Successfully reposted {success} of {total} listing(s).")
+            f"Reposted {success} of {total} listing(s)."
+            + (f"\n{skipped_paid} skipped — paid category, never paying."
+               if skipped_paid else "")
+            + (f"\n{needs_pay} could not be cleaned up — check cabinet "
+               f"tab Neachitate." if needs_pay else "")
+            + f"\n\n{detail}")
 
     # ── Console toggle ────────────────────────────────────────────────────────
     def _toggle_console(self):

@@ -11,7 +11,7 @@ import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
@@ -113,35 +113,140 @@ async def ensure_new_design(page):
 
 
 # ── Login ────────────────────────────────────────────────────────────────────
-async def login(page):
-    print("Navigating to login page …")
-    await page.goto(LOGIN_URL, wait_until="domcontentloaded")
-    await page.wait_for_timeout(1500)
+def _on_999(url: str) -> bool:
+    """
+    True only when the browser is actually ON 999.md. A naive `'999.md' in
+    url` check is wrong: the Simpals login/auth-confirm URLs carry
+    `redirectUrl=https%3A%2F%2F999.md%2F…` in their query string, so the
+    substring matches while we're still stuck on v2.simpalsid.com (this
+    false positive was the root cause of silent repost failures).
+    """
+    host = urlparse(url).hostname or ""
+    return host == "999.md" or host.endswith(".999.md")
 
-    await page.fill('input[type="text"]', EMAIL)
-    await page.fill('input[type="password"]', PASSWORD)
-    await page.click('button[type="submit"]')
 
-    # Auth-confirm step ("Accesați site-ul 999.md" button)
+async def _click_auth_confirm(page) -> bool:
+    """Click the 'Accesați site-ul 999.md' button on the auth-confirm page."""
     try:
-        await page.wait_for_url("**/auth-confirm**", timeout=8_000)
-        print("Auth-confirm page detected, clicking redirect button …")
-        confirm_btn = page.locator("button:has-text('Accesați'), a:has-text('Accesați'), button.Button_solid__gEcaH").first
-        await confirm_btn.wait_for(timeout=5_000)
-        await confirm_btn.click()
-    except PlaywrightTimeout:
-        pass
+        btn = page.locator(
+            "button:has-text('Accesați'), a:has-text('Accesați'), "
+            "button.Button_solid__gEcaH").first
+        await btn.wait_for(state="visible", timeout=10_000)
+        await btn.click()
+        return True
+    except Exception as e:
+        print(f"  [WARN] Auth-confirm click failed: {e}")
+        return False
 
-    try:
-        await page.wait_for_url("https://999.md/**", timeout=20_000)
-        print(f"Logged in successfully. URL: {page.url}")
-    except PlaywrightTimeout:
-        if "999.md" in page.url:
-            print(f"Logged in. URL: {page.url}")
-        else:
-            print(f"[WARN] Login may have failed. Current URL: {page.url}")
 
-    await ensure_new_design(page)
+async def login(page, max_attempts: int = 3):
+    """
+    Log in via Simpals ID. Verified live 2026-07-12 — the flow has three
+    states we must handle explicitly:
+      • password form  → fill + submit (wait for hydration first: filling the
+        React form too early makes the submit click a silent no-op);
+      • auth-confirm interstitial → click 'Accesați site-ul 999.md'. When a
+        SID session already exists, /login redirects straight here with NO
+        password form, so this must be handled on entry too;
+      • already on 999.md → done.
+    Success is verified against the real hostname (see _on_999) and retried;
+    on definitive failure we raise instead of letting callers scrape/fill a
+    login page.
+    """
+    last_note = ""
+    for attempt in range(1, max_attempts + 1):
+        print(f"Navigating to login page … (attempt {attempt}/{max_attempts})")
+        await page.goto(LOGIN_URL, wait_until="domcontentloaded")
+
+        # Wait for whichever state materialises first.
+        state = ""
+        for _ in range(30):                      # up to ~15 s
+            if _on_999(page.url):
+                state = "done"
+                break
+            if "auth-confirm" in page.url:
+                state = "confirm"
+                break
+            try:
+                if await page.locator('input[type="password"]').first.is_visible():
+                    state = "form"
+                    break
+            except Exception:
+                pass
+            await page.wait_for_timeout(500)
+
+        if state == "form":
+            await page.wait_for_timeout(700)     # let React attach handlers
+            await page.fill('input[type="text"]', EMAIL)
+            await page.fill('input[type="password"]', PASSWORD)
+            await page.click('button[type="submit"]')
+
+            # Wait to leave the login page; read any inline error so wrong
+            # credentials fail fast instead of retrying forever.
+            left = False
+            for _ in range(30):                  # up to ~15 s
+                if _on_999(page.url) or "auth-confirm" in page.url:
+                    left = True
+                    break
+                await page.wait_for_timeout(500)
+            if not left:
+                try:
+                    last_note = (await page.locator(
+                        '[class*="error" i], [role="alert"]'
+                    ).first.inner_text(timeout=1_000)).strip()
+                except Exception:
+                    last_note = ""
+                # Only credential-specific messages abort the retry loop —
+                # generic transient errors ("Something went wrong") must NOT
+                # match, so no bare "wrong"/"error" keywords here.
+                if last_note and re.search(
+                        r"(greșit|gresit|incorect|wrong password|wrong login"
+                        r"|invalid credential|неверн)",
+                        last_note, re.I):
+                    raise RuntimeError(
+                        f"Login failed — wrong credentials: {last_note}")
+                print(f"  [WARN] Still on login page"
+                      f"{' — ' + last_note if last_note else ''}; retrying …")
+                await page.wait_for_timeout(5_000)  # back off (rate limiting)
+                continue
+
+        if "auth-confirm" in page.url:
+            print("Auth-confirm page detected, clicking redirect button …")
+            await _click_auth_confirm(page)
+
+        # Final verification: we must land on the real 999.md host.
+        forced_nav = False
+        for i in range(40):                      # up to ~20 s
+            if _on_999(page.url):
+                break
+            # The auth-confirm click sometimes doesn't navigate even though
+            # the SID session is already established (seen as "Login failed
+            # after 3 attempts, stuck at …auth-confirm"). After ~10 s force
+            # a direct navigation and let the session cookie do the work.
+            if not forced_nav and i >= 20 and "auth-confirm" in page.url:
+                print("  Auth-confirm did not redirect — going to 999.md directly …")
+                await page.goto(BASE_URL + "/ro", wait_until="domcontentloaded")
+                forced_nav = True
+            await page.wait_for_timeout(500)
+        if forced_nav and _on_999(page.url):
+            # Direct navigation lands on 999.md even without a session —
+            # only accept it if we're actually logged in.
+            await page.wait_for_timeout(1500)
+            logged = await page.locator(
+                "#avatar-circle-header, a[href*='/cabinet/']").count()
+            if not logged:
+                print("  [WARN] Landed on 999.md logged-out; retrying login …")
+                continue
+        if _on_999(page.url):
+            print(f"Logged in successfully. URL: {page.url}")
+            await ensure_new_design(page)
+            return
+        last_note = f"ended at {page.url}"
+        print(f"  [WARN] Login attempt {attempt} {last_note}; retrying …")
+
+    raise RuntimeError(
+        f"Login failed after {max_attempts} attempts"
+        f"{' — ' + last_note if last_note else ''}")
 
 
 # ── Expand collapsed sections ────────────────────────────────────────────────
@@ -398,24 +503,54 @@ async def cmd_scrape():
         print("Navigating to My Ads …")
         await navigate_to_my_ads(page)
 
-        # Collect listing URLs across all pages
+        # Collect listing URLs across all pages.
+        # Skip "Cumpăra" cards entirely — those are wanted-ads (buyer looking
+        # for an item) and must not be re-posted. We read each card's type
+        # badge from the DOM and drop matches before they ever hit the detail
+        # scraper.
         ad_urls = []
+        skipped_cumpara = 0
         page_num = 1
         while True:
             print(f"Scanning page {page_num} …")
-            all_a = await page.query_selector_all("a[href]")
+            cards = await page.evaluate(f"""(BASE_URL) => {{
+                // Each cabinet ad card wraps a single listing link whose last
+                // URL segment is a pure digit (e.g. /ro/12345678). Walk those
+                // anchors and inspect the surrounding card text for a
+                // "Cumpăr"/"Cumpara" badge.
+                const out = [];
+                const seen = new Set();
+                for (const a of document.querySelectorAll('a[href]')) {{
+                    let href = a.getAttribute('href') || '';
+                    if (!href.startsWith('http')) href = BASE_URL + href;
+                    const clean = href.split('?')[0].replace(/\\/$/, '');
+                    const last = clean.split('/').pop();
+                    if (!/^\\d+$/.test(last)) continue;
+                    if (seen.has(clean)) continue;
+                    seen.add(clean);
+                    // Walk up to the nearest card-ish container to read its text.
+                    let card = a;
+                    for (let i = 0; i < 6 && card.parentElement; i++) {{
+                        card = card.parentElement;
+                        const cls = (card.className || '').toString().toLowerCase();
+                        if (cls.includes('card') || cls.includes('item') || cls.includes('advert')) break;
+                    }}
+                    const text = (card.innerText || '').toLowerCase();
+                    const isCumpara = /\\bcump[ăa]r/.test(text);
+                    out.push({{ url: clean, isCumpara }});
+                }}
+                return out;
+            }}""", BASE_URL)
             hrefs = []
-            for a in all_a:
-                href = await a.get_attribute("href") or ""
-                if not href.startswith("http"):
-                    href = BASE_URL + href
-                # Strip query params for canonical form
-                clean = href.split("?")[0].rstrip("/")
-                # New 999.md listing URLs: 999.md/ro/<pure_number>
-                last = clean.split("/")[-1]
-                if last.isdigit() and clean not in ad_urls:
-                    hrefs.append(clean)
-                    ad_urls.append(clean)
+            for c in cards:
+                if c["url"] in ad_urls:
+                    continue
+                if c["isCumpara"]:
+                    skipped_cumpara += 1
+                    print(f"  [skip] Cumpăra listing: {c['url']}")
+                    continue
+                hrefs.append(c["url"])
+                ad_urls.append(c["url"])
             print(f"  Found {len(hrefs)} ads on page {page_num}")
 
             # Next page
@@ -435,7 +570,7 @@ async def cmd_scrape():
             except Exception:
                 break
 
-        print(f"Total ads found: {len(ad_urls)}")
+        print(f"Total ads found: {len(ad_urls)} (skipped {skipped_cumpara} Cumpăra)")
         if not ad_urls:
             print("[WARN] No ads found. Check that you are logged in and have active listings.")
             await browser.close()
@@ -698,47 +833,53 @@ async def fill_dropdown(page, label_text: str, value: str) -> bool:
 # ── Currency toggle (€ | MDL | $) ────────────────────────────────────────────
 async def select_currency(page, currency: str) -> bool:
     """
-    Click the currency unit trigger that sits next to the price input and
-    pick the matching option. The price's unit trigger is the first
-    `button[data-testid$=".unit"][aria-haspopup="listbox"]` in the form
-    DOM order (verified live 2026-05-14 — other `.unit` triggers like
-    "Prima rată" / "Rulaj" come later in the page).
+    Set the currency unit next to the price input. Anchor on the price
+    INPUT itself (id "2.value" / placeholder "Introdu prețul") and climb to
+    the wrapper that holds its `button[data-testid$=".unit"]` — the old
+    label-anchored walk from the "Preț" title span landed on the wrong
+    container on transport/cars, where the price block is a bare
+    `styles_wrapper` outside any `field__row` (verified live 2026-07-16).
+    The unit widget also carries `input[data-testid$=".unit-hidden-input"]`
+    with values like UNIT_EUR — if it already matches, no click is needed
+    (cars defaults to €, so EUR listings need no toggling at all).
     """
-    symbol = {"EUR": "€", "USD": "$", "MDL": "MDL"}.get(currency.upper())
+    cur = currency.upper()
+    symbol = {"EUR": "€", "USD": "$", "MDL": "MDL"}.get(cur)
     if not symbol:
         return False
 
-    # Locate the price field's unit trigger via the JS helper used by
-    # fill_dropdown — anchor to the "Preț" title span, walk up to the
-    # field row, look for the `.unit` button inside.
-    testid = await page.evaluate("""() => {
-        let title = null;
-        for (const sp of document.querySelectorAll('span')) {
-            const t = (sp.innerText || '').trim().replace(/\\s*\\*$/, '').trim();
-            if (t !== 'Preț') continue;
-            if (!(sp.className || '').toString().includes('title__name')) continue;
-            title = sp;
-            break;
+    info = await page.evaluate("""() => {
+        const price = document.getElementById('2.value') ||
+            document.querySelector('input[placeholder*="prețul" i], ' +
+                                   'input[placeholder*="pretul" i]');
+        if (!price) return {error: 'no_price_input'};
+        let node = price;
+        for (let i = 0; i < 8 && node; i++) {
+            node = node.parentElement;
+            if (!node) break;
+            const btn = node.querySelector('button[data-testid$=".unit"]');
+            if (btn) {
+                const hidden = node.querySelector(
+                    'input[data-testid$=".unit-hidden-input"]');
+                return {testid: btn.getAttribute('data-testid'),
+                        text: (btn.innerText || '').trim(),
+                        hidden: hidden ? (hidden.value || '') : ''};
+            }
         }
-        if (!title) return null;
-        let row = title;
-        for (let i = 0; i < 10; i++) {
-            row = row.parentElement;
-            if (!row) break;
-            const cls = (row.className || '').toString();
-            if (cls.includes('field__row__86QTX') ||
-                (cls.includes('field__row') && !cls.includes('field__row__title'))) break;
-        }
-        if (!row) return null;
-        const btn = row.querySelector('button[data-testid$=".unit"][aria-haspopup="listbox"]');
-        return btn ? btn.getAttribute('data-testid') : null;
+        return {error: 'no_unit_button'};
     }""")
 
-    if not testid:
-        # Fallback: first unit trigger on the page (price is first in DOM).
-        testid_sel = 'button[data-testid$=".unit"][aria-haspopup="listbox"]'
-    else:
-        testid_sel = f'button[data-testid="{testid}"]'
+    if not info or info.get("error"):
+        print(f"      [DBG] currency: {(info or {}).get('error', 'null')}")
+        return False
+
+    # Already on the right unit? (hidden value UNIT_EUR/UNIT_USD/UNIT_MDL,
+    # or the trigger visibly shows the symbol)
+    if info.get("hidden", "").upper() == f"UNIT_{cur}" or \
+            info.get("text", "").strip() == symbol:
+        return True
+
+    testid_sel = f'button[data-testid="{info["testid"]}"]'
 
     try:
         trigger = page.locator(testid_sel).first
@@ -841,9 +982,293 @@ async def dismiss_plate_modal(page) -> None:
 
 
 # ── Repost command ────────────────────────────────────────────────────────────
-async def repost_listing(page, listing: dict) -> dict:
+MAX_WIZARD_STEPS = 5   # transport/cars uses a multi-step form; most are 1 step
+
+# Categories where 999.md charges a publication fee with NO free option
+# (verified live 2026-07-16: cars' cheapest package = Basic 5 MDL/30 zile).
+# The user's hard rule: NEVER pay — repost only where free publishing works,
+# so these are skipped before the form is even opened. If another paid
+# category slips through, the runtime safety net deletes the created ad.
+PAID_SUBCATEGORIES = ("transport/cars",)
+
+
+async def delete_ad(page, ad_id: str) -> bool:
+    """
+    Delete one of our own ads from its owner-view page. Used to roll back
+    an ad that a paid category created before the fee requirement became
+    visible (the ad would otherwise pile up in cabinet → Neachitate).
+    Owner toolbar buttons carry data-testids: publicate / edit / delete
+    ("Ştergere") — verified live 2026-07-17 on the new design.
+    """
+    try:
+        await page.goto(f"{BASE_URL}/ro/{ad_id}", wait_until="domcontentloaded")
+        await page.wait_for_timeout(2000)
+        btn = page.locator('[data-testid="delete"]').first
+        await btn.click(timeout=5000)
+        await page.wait_for_timeout(1000)
+        # Confirmation dialog — click the affirmative button. Its label uses
+        # the CEDILLA spelling "Ştergere" (U+015E, not comma-below "Șterge",
+        # verified live 2026-07-17) and the container has no role="dialog",
+        # so match by regex over any visible button EXCEPT the owner
+        # toolbar's own delete trigger.
+        confirmed = False
+        candidates = page.locator(
+            'button:not([data-testid="delete"])',
+            has_text=re.compile(r"^\s*[SŞȘsșş]terge(re)?\s*$", re.I))
+        for _ in range(6):                       # dialog may mount slowly
+            try:
+                for i in range(await candidates.count()):
+                    b = candidates.nth(i)
+                    if await b.is_visible():
+                        await b.click(timeout=2000)
+                        confirmed = True
+                        break
+            except Exception:
+                pass
+            if confirmed:
+                break
+            await page.wait_for_timeout(500)
+        if not confirmed:
+            # Dump whatever dialog appeared so the log explains a miss.
+            texts = await page.evaluate("""() => {
+                const out = [];
+                for (const el of document.querySelectorAll(
+                    '[role="dialog"] button, [class*="modal" i] button')) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width && r.height) out.push((el.innerText || '').trim());
+                }
+                return out.slice(0, 10);
+            }""")
+            print(f"    [WARN] Delete confirm dialog not matched; buttons={texts}")
+        await page.wait_for_timeout(2000)
+        # Verify: after deletion the owner toolbar (and its delete button)
+        # disappears from the ad page.
+        await page.goto(f"{BASE_URL}/ro/{ad_id}", wait_until="domcontentloaded")
+        await page.wait_for_timeout(2000)
+        gone = await page.locator('[data-testid="delete"]').count() == 0
+        print(f"    Delete ad {ad_id}: {'✓ deleted' if gone else '✗ still exists'}")
+        return gone
+    except Exception as e:
+        print(f"    [WARN] delete_ad({ad_id}) failed: {e}")
+        return False
+
+
+async def _visible_form_errors(page) -> list:
+    """Collect visible validation/error texts currently shown on the form."""
+    return await page.evaluate("""() => {
+        const out = [];
+        for (const el of document.querySelectorAll(
+            '[class*="error" i], [role="alert"]')) {
+            const r = el.getBoundingClientRect();
+            if (r.width === 0 && r.height === 0) continue;
+            const t = (el.innerText || '').trim();
+            if (t && t.length < 200) out.push(t);
+        }
+        return [...new Set(out)].slice(0, 15);
+    }""")
+
+
+async def _form_signature(page) -> str:
+    """
+    Fingerprint of the currently mounted form step: sorted visible field
+    labels + input count. Changes when a wizard advances to its next step,
+    stays identical when a "Continuați" click bounced off validation.
+    """
+    return await page.evaluate("""() => {
+        const labels = [];
+        for (const sp of document.querySelectorAll('span')) {
+            if (!(sp.className || '').toString().includes('title__name')) continue;
+            const r = sp.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) continue;
+            labels.push((sp.innerText || '').trim());
+        }
+        const inputs = document.querySelectorAll(
+            'input:not([type=hidden]), textarea').length;
+        return labels.sort().join('|') + '#' + inputs;
+    }""")
+
+
+def _is_published(url: str) -> bool:
+    """
+    True once the browser left the add form for a page that carries the new
+    ad's id: the classic success redirect (`…/<digits>`) or the promo
+    "Ultimul pas" page (`/ro/services/<digits>?pageType=packages`).
+    """
+    last = url.split("?")[0].rstrip("/").split("/")[-1]
+    return "success" in url or last.isdigit()
+
+
+def _classify_publish(url: str) -> tuple:
+    """
+    (status, note) for a published-ad URL. Free categories (phones, parts,
+    …) redirect with `freePublish=true` and the ad goes live immediately.
+    Paid categories (transport/cars: 5 MDL "Basic" fee) land on the same
+    /services page WITHOUT freePublish — the ad is created but sits in the
+    cabinet's "unpaid" tab until the fee is paid. Verified live 2026-07-16.
+    """
+    if "/services/" in url and "freePublish=true" not in url:
+        return ("needs_payment",
+                "Anunț creat, dar categoria cere taxă de publicare — "
+                "achită din cabinet (tab Neachitate) ca să apară pe site.")
+    return "success", ""
+
+
+async def _find_submit(page):
+    """Return (locator, text, data-testid) of the form's final CTA button."""
+    submit = page.locator(
+        'button:has-text("Publică anunțul"), '
+        'button:has-text("Publică"), '
+        'button:has-text("Continuați"), '
+        'button:has-text("Continuati"), '
+        'button[type="submit"]'
+    ).last
+    try:
+        btn_text = (await submit.inner_text()).strip()
+    except Exception:
+        btn_text = ""
+    try:
+        testid = await submit.get_attribute("data-testid") or ""
+    except Exception:
+        testid = ""
+    return submit, btn_text, testid
+
+
+async def _fill_visible_fields(page, listing: dict, done: dict) -> int:
+    """
+    Fill every listing field that exists on the CURRENT form state and
+    return how many NEW fields were completed. Successes are remembered in
+    `done`: fields not yet in the DOM simply miss here ('·') and are picked
+    up on a later pass; filled ones are never touched again. Callers run
+    this to a fixpoint because most 999.md forms mount progressively —
+    e.g. on mobile-phones, Marcă/Model/Preț/Regiune only appear after
+    "Tip dispozitiv" is selected.
+    """
+    start_count = len(done)
+
+    async def once(key, coro_fn, desc):
+        if done.get(key):
+            return
+        try:
+            ok = await coro_fn()
+        except Exception as e:
+            print(f"    {desc} → ✗ ({e})")
+            return
+        if ok:
+            done[key] = True
+        print(f"    {desc} → {'✓' if ok else '·'}")
+
+    # Region (always Chișinău)
+    await once("region",
+               lambda: fill_dropdown(page, "Regiune", "Chișinău"),
+               "Regiune='Chișinău'")
+
+    # Price + currency toggle
+    price_num = re.sub(r"[^\d.]", "", listing.get("price", "") or "")
+    if price_num:
+        await once("price",
+                   lambda: fill_input(page, "Introdu prețul", price_num),
+                   f"Preț={price_num!r}")
+    currency = (listing.get("currency") or "").upper()
+    if currency and done.get("price"):
+        await once("currency",
+                   lambda: select_currency(page, currency),
+                   f"Currency={currency}")
+
+    # Characteristics
+    for attr_key, attr_val in (listing.get("attributes", {}) or {}).items():
+        if attr_key == "An de fabricație":
+            await once(f"attr:{attr_key}",
+                       lambda v=attr_val: fill_input(
+                           page, "Introdu an de fabricație", v),
+                       f"{attr_key}={attr_val!r}")
+        else:
+            await once(f"attr:{attr_key}",
+                       lambda k=attr_key, v=attr_val: fill_dropdown(page, k, v),
+                       f"{attr_key}={attr_val!r}")
+
+    # Checkbox feature lists (Dotări, Securitate, …)
+    for group_name, items in (listing.get("feature_lists", {}) or {}).items():
+        for item in items:
+            await once(f"feat:{group_name}:{item}",
+                       lambda i=item: tick_checkbox(page, i),
+                       f"[{group_name}] {item!r}")
+
+    # Titles (RO + RU both required)
+    if not done.get("titles"):
+        title = listing.get("title", "Untitled")
+        title_inputs = await page.query_selector_all(
+            "input[placeholder*='titlul'], input[placeholder*='Titlul'], "
+            "input[placeholder*='anunțului'], input[placeholder*='anuntului']"
+        )
+        if title_inputs:
+            for inp in title_inputs:
+                await inp.fill(title)
+            done["titles"] = True
+            print(f"    Titles filled: {len(title_inputs)} input(s)")
+
+    # Description (RO + RU textareas)
+    desc = listing.get("description", "")
+    if desc and not done.get("description"):
+        # Defensive strip — older listings.json caches (scraped before we
+        # anchored to `description__body`) end with the trailing "Citește
+        # tot" expander label baked into the description text.
+        desc = re.sub(
+            r"\n?\s*(Cite[șs]te\s+(tot|mai\s+mult)|Show\s+more|Read\s+more|"
+            r"Показать\s+(всё|все)|Подробнее|Читать\s+далее)\s*$",
+            "",
+            desc,
+            flags=re.IGNORECASE,
+        ).rstrip()
+        desc_areas = await page.query_selector_all(
+            "textarea[placeholder*='detalii'], textarea[placeholder*='Detalii']"
+        )
+        if desc_areas:
+            for ta in desc_areas:
+                await ta.fill(desc)
+            done["description"] = True
+            print(f"    Description filled: {len(desc_areas)} textarea(s)")
+
+    # Photos — upload exactly once, whichever step exposes the file input
+    if not done.get("photos"):
+        local_images = [p for p in listing.get("local_images", [])
+                        if Path(p).exists()]
+        if local_images:
+            try:
+                file_input = page.locator('input[type="file"]').first
+                if await file_input.count():
+                    await file_input.set_input_files(local_images[:20])
+                    await page.wait_for_timeout(3000)
+                    done["photos"] = True
+                    print(f"    Photos: {len(local_images)} uploaded")
+                    # Car listings show a modal asking whether to blur the
+                    # licence plates — always decline (keep plates visible).
+                    await dismiss_plate_modal(page)
+            except Exception as e:
+                print(f"    [WARN] Photo upload failed: {e}")
+
+    return len(done) - start_count
+
+
+async def repost_listing(page, listing: dict, dry_run: bool = False) -> dict:
     title = listing.get("title", "Untitled")
     print(f"  Reposting: {title}")
+
+    # Hard rule: NEVER pay. Known fee-only categories are skipped before the
+    # form is even opened (posting there always ends at the 5 MDL "Ultimul
+    # pas" payment page, leaving a stray unpaid ad).
+    cat_url = listing.get("category_url", "") or ""
+    if any(p in cat_url for p in PAID_SUBCATEGORIES):
+        entry = {
+            "original_url": listing.get("url", ""),
+            "title": title,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "status": "skipped_paid",
+            "new_url": "",
+            "error": ("Categorie cu taxă de publicare pe 999.md (fără "
+                      "opțiune gratuită) — repostare sărită, nu plătim."),
+        }
+        print(f"    [SKIP] {entry['error']}")
+        return entry
 
     # Build add URL with category pre-selected.
     # category_url is like /ro/list/transport/spare-parts-for-cars
@@ -865,14 +1290,6 @@ async def repost_listing(page, listing: dict) -> dict:
         elif len(parts) == 1:
             add_url = f"{BASE_URL}/ro/add?category={parts[0]}"
 
-    await page.goto(add_url, wait_until="domcontentloaded")
-    await page.wait_for_timeout(2000)
-
-    # Some categories (esp. transport/cars) hide most of their checkbox
-    # features behind an "Afișează totul" / "Mai multe" expander on the add
-    # form. Click it before we start filling so the targets exist in the DOM.
-    await expand_collapsibles(page)
-
     log_entry = {
         "original_url": listing.get("url", ""),
         "title": title,
@@ -881,6 +1298,49 @@ async def repost_listing(page, listing: dict) -> dict:
         "new_url": "",
         "error": "",
     }
+
+    await page.goto(add_url, wait_until="domcontentloaded")
+    await page.wait_for_timeout(2000)
+
+    # An expired session bounces /ro/add to the Simpals login page. Without
+    # this guard the code "fills" the login page (every field fails) and even
+    # clicks its "Intră" button as the submit — re-login and come back instead.
+    if "simpalsid.com" in page.url:
+        print("    Session lost — re-logging in …")
+        try:
+            await login(page)
+        except RuntimeError as e:
+            log_entry["status"] = "error"
+            log_entry["error"] = str(e)
+            print(f"    [ERROR] {e}")
+            return log_entry
+        await page.goto(add_url, wait_until="domcontentloaded")
+        await page.wait_for_timeout(2000)
+
+    # Wait for the add form to actually mount before filling anything.
+    # Two deliberate choices here:
+    #   • accept ANY field label (`title__name`), not just "Preț" — a
+    #     multi-step wizard's first step may not contain the price field;
+    #   • retry with a reload — the SPA sometimes hangs on first load
+    #     (this was the intermittent "Add form did not load" failure on
+    #     phone-and-communication/mobile-phones).
+    form_ok = False
+    for attempt in range(1, 4):
+        for _ in range(10):
+            if await page.locator('span[class*="title__name"]').count():
+                form_ok = True
+                break
+            await page.wait_for_timeout(1000)
+        if form_ok:
+            break
+        print(f"    Form not mounted (attempt {attempt}/3) — reloading …")
+        await page.reload(wait_until="domcontentloaded")
+        await page.wait_for_timeout(2000)
+    if not form_ok:
+        log_entry["status"] = "error"
+        log_entry["error"] = f"Add form did not load (stuck at {page.url})"
+        print(f"    [ERROR] {log_entry['error']}")
+        return log_entry
 
     try:
         # ── Category wizard (if not pre-set via URL) ─────────────────────────
@@ -896,116 +1356,124 @@ async def repost_listing(page, listing: dict) -> dict:
 
         await page.wait_for_timeout(1000)
 
-        # ── Region (always Chișinău) ─────────────────────────────────────────
-        ok = await fill_dropdown(page, "Regiune", "Chișinău")
-        print(f"    Regiune='Chișinău' → {'✓' if ok else '✗'}")
-
-        # ── Price ────────────────────────────────────────────────────────────
-        price_num = re.sub(r"[^\d.]", "", listing.get("price", "") or "")
-        ok = await fill_input(page, "Introdu prețul", price_num)
-        print(f"    Preț={price_num!r} → {'✓' if ok else '✗'}")
-
-        # ── Currency (€ / MDL / $ toggle next to the price) ─────────────────
-        currency = (listing.get("currency") or "").upper()
-        if currency:
-            cur_clicked = await select_currency(page, currency)
-            print(f"    Currency={currency} → {'✓' if cur_clicked else '✗'}")
-
-        # ── Characteristics ──────────────────────────────────────────────────
-        attrs = listing.get("attributes", {})
-        for attr_key, attr_val in attrs.items():
-            if attr_key == "An de fabricație":
-                ok = await fill_input(page, "Introdu an de fabricație", attr_val)
-            else:
-                ok = await fill_dropdown(page, attr_key, attr_val)
-            print(f"    {attr_key}={attr_val!r} → {'✓' if ok else '✗'}")
-
-        # ── Checkbox feature lists (Dotări, etc.) ────────────────────────────
-        feat_lists = listing.get("feature_lists", {}) or {}
-        if feat_lists:
-            # Ensure any "Afișează totul" inside characteristic sections is open
+        # ── Fill the form, step by step ──────────────────────────────────────
+        # Single-step categories (parts, phones, …) publish on the first
+        # pass. transport/cars labels its submit "Continuați" and the click
+        # itself creates the ad (payment step follows) — so after every
+        # advance we first check whether we already landed on a published-ad
+        # URL before touching anything else.
+        filled: dict = {}
+        submit = None
+        btn_text = ""
+        btn_testid = ""
+        for step in range(1, MAX_WIZARD_STEPS + 1):
+            if _is_published(page.url):
+                break
+            # Some categories hide most checkbox features behind an
+            # "Afișează totul" expander — open before filling each step.
             await expand_collapsibles(page)
-        for group_name, items in feat_lists.items():
-            for item in items:
-                ticked = await tick_checkbox(page, item)
-                print(f"    [{group_name}] {item!r} → {'✓' if ticked else '✗'}")
-
-        # ── Titles (RO + RU both required) ───────────────────────────────────
-        title_inputs = await page.query_selector_all(
-            "input[placeholder*='titlul'], input[placeholder*='Titlul'], "
-            "input[placeholder*='anunțului'], input[placeholder*='anuntului']"
-        )
-        for inp in title_inputs:
-            await inp.fill(title)
-        print(f"    Titles filled: {len(title_inputs)} input(s)")
-
-        # ── Description (RO + RU textareas) ──────────────────────────────────
-        desc = listing.get("description", "")
-        if desc:
-            # Defensive strip — older listings.json caches (scraped before
-            # we anchored to `description__body`) end with the trailing
-            # "Citește tot" expander label baked into the description text.
-            desc = re.sub(
-                r"\n?\s*(Cite[șs]te\s+(tot|mai\s+mult)|Show\s+more|Read\s+more|"
-                r"Показать\s+(всё|все)|Подробнее|Читать\s+далее)\s*$",
-                "",
-                desc,
-                flags=re.IGNORECASE,
-            ).rstrip()
-            desc_areas = await page.query_selector_all(
-                "textarea[placeholder*='detalii'], textarea[placeholder*='Detalii']"
-            )
-            for ta in desc_areas:
-                await ta.fill(desc)
-            print(f"    Description filled: {len(desc_areas)} textarea(s)")
-
-        # ── Photos ───────────────────────────────────────────────────────────
-        local_images = [p for p in listing.get("local_images", []) if Path(p).exists()]
-        if local_images:
-            try:
-                file_input = page.locator('input[type="file"]').first
-                await file_input.set_input_files(local_images[:20])
-                await page.wait_for_timeout(3000)
-                print(f"    Photos: {len(local_images)} uploaded")
-            except Exception as e:
-                print(f"    [WARN] Photo upload failed: {e}")
-
-            # Car listings show a modal asking whether to blur the licence
-            # plates. We always decline (user wants the plates kept visible).
-            await dismiss_plate_modal(page)
-
-        # ── Submit ───────────────────────────────────────────────────────────
-        submit = page.locator(
-            'button:has-text("Publică anunțul"), '
-            'button:has-text("Publică"), '
-            'button:has-text("Continuați"), '
-            'button:has-text("Continuati"), '
-            'button[type="submit"]'
-        ).last
-
-        # If the final CTA is "Continuați", the form needs more wizard steps
-        # than we support — bail out instead of leaving a half-filled draft.
-        try:
-            btn_text = (await submit.inner_text()).strip()
-        except Exception:
-            btn_text = ""
-        if re.search(r"continua[țt]i", btn_text, re.I):
-            log_entry["status"] = "skipped_continuati"
-            log_entry["error"] = f"Submit button reads {btn_text!r} — multi-step form, skipped"
-            print(f"    [SKIP] Submit reads {btn_text!r}; skipping listing.")
+            # Fill to a fixpoint: selecting one dropdown often mounts more
+            # fields (mobile-phones shows only "Tip dispozitiv" at first).
+            for _pass in range(6):
+                if await _fill_visible_fields(page, listing, filled) == 0:
+                    break
+                await page.wait_for_timeout(500)
+            submit, btn_text, btn_testid = await _find_submit(page)
+            if not re.search(r"continua[țt]i", btn_text, re.I):
+                break
+            print(f"    Step {step}: CTA is {btn_text!r} — advancing …")
+            sig_before = await _form_signature(page)
+            await submit.click()
+            # The step advanced when we left the form (ad created) or the
+            # visible field set changed; an unchanged form means validation
+            # bounced the click.
+            advanced = False
+            for _ in range(10):
+                await page.wait_for_timeout(1000)
+                if _is_published(page.url) or \
+                        await _form_signature(page) != sig_before:
+                    advanced = True
+                    break
+            if not advanced:
+                errs = await _visible_form_errors(page)
+                log_entry["status"] = "incomplete"
+                log_entry["error"] = (
+                    f"Wizard stuck at step {step}: "
+                    + ("; ".join(errs) if errs
+                       else "form unchanged after Continuați click"))
+                print(f"    [ERROR] {log_entry['error']}")
+                return log_entry
+        else:
+            log_entry["status"] = "incomplete"
+            log_entry["error"] = (f"CTA still reads {btn_text!r} after "
+                                  f"{MAX_WIZARD_STEPS} wizard steps")
+            print(f"    [ERROR] {log_entry['error']}")
             return log_entry
 
-        await submit.click()
-        await page.wait_for_timeout(4000)
+        unfilled = [k for k in
+                    ([f"attr:{a}" for a in (listing.get("attributes") or {})]
+                     + ["region", "titles"])
+                    if not filled.get(k)]
+        if unfilled and not _is_published(page.url):
+            print(f"    [WARN] Unfilled after all steps: {unfilled}")
 
-        # Success = URL changed to a numeric listing ID
+        # ── Submit & outcome ─────────────────────────────────────────────────
+        if not _is_published(page.url):
+            if dry_run:
+                log_entry["status"] = "dry_run"
+                log_entry["error"] = (f"DRY RUN — stopped before {btn_text!r}; "
+                                      f"unfilled: {unfilled or 'none'}")
+                print(f"    [DRY RUN] Final CTA {btn_text!r}; not clicked.")
+                return log_entry
+            # Never "submit" via the site header's search button — that's
+            # the button[type=submit] fallback matching when a form has no
+            # real CTA (e.g. an unexpected page).
+            if btn_testid == "header-search-button" or not btn_text:
+                log_entry["status"] = "incomplete"
+                log_entry["error"] = (f"No publish button found "
+                                      f"(page: {page.url})")
+                print(f"    [ERROR] {log_entry['error']}")
+                return log_entry
+            await submit.click()
+
+        # Watch the outcome for up to ~24 s: either 999.md redirects to the
+        # success page / new listing URL, or validation errors surface on the
+        # form. Capture those errors verbatim so the log says WHY it failed.
+        form_errors: list[str] = []
         new_url = page.url
-        if new_url != add_url and "add" not in new_url.split("?")[0].rstrip("/").split("/")[-1]:
-            log_entry["status"] = "success"
+        for _ in range(8):
+            if _is_published(new_url):
+                break
+            await page.wait_for_timeout(3000)
+            new_url = page.url
+            if _is_published(new_url):
+                break
+            form_errors = await _visible_form_errors(page)
+            if form_errors:
+                break
+
+        if _is_published(new_url):
+            log_entry["status"], note = _classify_publish(new_url)
+            log_entry["error"] = note
+            if log_entry["status"] == "needs_payment":
+                # Safety net for paid categories not in PAID_SUBCATEGORIES:
+                # the ad already exists but can only go live for money —
+                # delete it so nothing piles up in cabinet → Neachitate.
+                m = re.search(r"/(?:services/)?(\d+)", new_url.split("?")[0])
+                if m and await delete_ad(page, m.group(1)):
+                    log_entry["status"] = "skipped_paid"
+                    log_entry["error"] = (
+                        "Categorie cu taxă — anunțul creat a fost șters "
+                        "automat (nu plătim).")
+        elif form_errors:
+            log_entry["status"] = "incomplete"
+            log_entry["error"] = "Form validation: " + "; ".join(form_errors)
         else:
-            log_entry["status"] = "incomplete"  # form had errors
+            log_entry["status"] = "incomplete"
+            log_entry["error"] = f"No success redirect after submit (stuck at {new_url})"
         log_entry["new_url"] = new_url
-        print(f"    → {new_url}  [{log_entry['status']}]")
+        print(f"    → {new_url}  [{log_entry['status']}]"
+              + (f"  ({log_entry['error']})" if log_entry["error"] else ""))
 
     except Exception as e:
         log_entry["status"] = "error"
