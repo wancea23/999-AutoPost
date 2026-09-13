@@ -143,8 +143,8 @@ async def login(page, max_attempts: int = 3):
     """
     Log in via Simpals ID. Verified live 2026-07-12 — the flow has three
     states we must handle explicitly:
-      • password form  → fill + submit (wait for hydration first: filling the
-        React form too early makes the submit click a silent no-op);
+      • password form  → fill + submit (wait for reCAPTCHA and hydration
+        first: submitting too early sends no login request at all);
       • auth-confirm interstitial → click 'Accesați site-ul 999.md'. When a
         SID session already exists, /login redirects straight here with NO
         password form, so this must be handled on entry too;
@@ -176,6 +176,17 @@ async def login(page, max_attempts: int = 3):
             await page.wait_for_timeout(500)
 
         if state == "form":
+            # "Intră" only sends the login once Google reCAPTCHA has loaded.
+            # Clicked earlier, no request goes out and the page just says
+            # "Something went wrong" (2026-09-13: every first attempt failed
+            # that way and only the retry got in, ~20 s lost per account).
+            try:
+                await page.wait_for_function(
+                    "() => window.grecaptcha && "
+                    "typeof window.grecaptcha.execute === 'function'",
+                    timeout=10_000)
+            except Exception:
+                pass                             # no reCAPTCHA: old path
             await page.wait_for_timeout(700)     # let React attach handlers
             await page.fill('input[type="text"]', EMAIL)
             await page.fill('input[type="password"]', PASSWORD)
@@ -981,28 +992,96 @@ async def dismiss_plate_modal(page) -> None:
         await page.wait_for_timeout(400)
 
 
+async def dismiss_onboarding(page) -> bool:
+    """
+    Kill the IntroJS coach-mark 999.md shows on a freshly opened add form
+    ("Completează primii pași … Am înțeles"). Verified live 2026-08-15.
+
+    Why this matters: `.introjs-tooltipReferenceLayer` sits at z-index 1e8
+    over the form's FIRST field, so Playwright refuses the click with
+    "<div class='introjs-tooltipReferenceLayer'> … intercepts pointer
+    events". On phone-and-communication/mobile-phones that first field is
+    "Tip dispozitiv" — and because Marcă/Model/Preț/Regiune only mount once
+    it is selected, the whole form stayed at 50%, no publish button ever
+    rendered, and `_find_submit` fell through to the header search button
+    → "No publish button found".
+
+    Prefer the tour's own "Am înțeles" anchor (that's what persists the
+    seen-flag, so it stops coming back); then rip out any layer left over —
+    `.introjs-tour` is a body-level sibling holding only tour chrome, it
+    never contains the form, so removing it is safe. Returns True if
+    anything was dismissed.
+    """
+    try:
+        acted = await page.evaluate("""() => {
+            let acted = 0;
+            try {
+                const btn = document.querySelector(
+                    '.introjs-tooltipbuttons .introjs-nextbutton, '
+                    + '.introjs-tooltipbuttons a, '
+                    + '.introjs-tooltipbuttons button');
+                if (btn) { btn.click(); acted++; }
+            } catch (e) { /* tour mid-teardown */ }
+            for (const sel of ['.introjs-overlay', '.introjs-helperLayer',
+                               '.introjs-tooltipReferenceLayer',
+                               '.introjs-disableInteraction', '.introjs-tour']) {
+                for (const el of document.querySelectorAll(sel)) {
+                    el.remove(); acted++;
+                }
+            }
+            document.body.classList.remove('add-form-hint-active',
+                                           'onboarding-active');
+            for (const el of document.querySelectorAll('.introjs-showElement')) {
+                el.classList.remove('introjs-showElement');
+            }
+            return acted;
+        }""")
+    except Exception:
+        return False
+    return bool(acted)
+
 # ── Repost command ────────────────────────────────────────────────────────────
 MAX_WIZARD_STEPS = 5   # transport/cars uses a multi-step form; most are 1 step
 
-# Categories where 999.md charges a publication fee with NO free option
-# (verified live 2026-07-16: cars' cheapest package = Basic 5 MDL/30 zile).
-# The user's hard rule: NEVER pay — repost only where free publishing works,
-# so these are skipped before the form is even opened. If another paid
-# category slips through, the runtime safety net deletes the created ad.
-PAID_SUBCATEGORIES = ("transport/cars",)
+# Free vs paid is decided per ad, never per category. 999.md caps FREE ads
+# per subcategory, per month, per account (Autoturisme in 2026-09: 1 a month,
+# shown on the add form as "Au rămas N anunț gratuit") and deleting an ad
+# does not give the slot back. The same car category was free on one account
+# and paid on another the same day (2026-07-16), so the old hardcoded
+# "transport/cars is paid" list skipped cars that could have gone out free.
+# The user's hard rule stays: NEVER pay. We publish, read 999.md's answer
+# (_classify_publish) and delete the ad again if it landed on the fee page.
 
 
-async def delete_ad(page, ad_id: str) -> bool:
+async def delete_ad(page, ad_id: str, require_unpaid: bool = False) -> bool:
     """
     Delete one of our own ads from its owner-view page. Used to roll back
-    an ad that a paid category created before the fee requirement became
-    visible (the ad would otherwise pile up in cabinet → Neachitate).
+    an ad that 999.md only offered to publish for a fee (no free slot left
+    this month) — it would otherwise sit unpaid in the cabinet.
     Owner toolbar buttons carry data-testids: publicate / edit / delete
     ("Ştergere") — verified live 2026-07-17 on the new design.
+
+    require_unpaid: delete only when the owner page itself says "Anunțul nu
+    este plătit" (verified live 2026-09-13). The fee decision comes from the
+    redirect URL; this second signal makes sure a misread URL can never
+    delete an ad that actually went live for free.
     """
     try:
         await page.goto(f"{BASE_URL}/ro/{ad_id}", wait_until="domcontentloaded")
         await page.wait_for_timeout(2000)
+        if require_unpaid:
+            unpaid = False
+            for _ in range(6):                   # the ad body renders late
+                body = await page.evaluate(
+                    "() => document.body ? document.body.innerText : ''")
+                if re.search(r"nu\s+este\s+pl[ăa]tit", body, re.I):
+                    unpaid = True
+                    break
+                await page.wait_for_timeout(1000)
+            if not unpaid:
+                print(f"    [WARN] Ad {ad_id} is not marked unpaid — NOT "
+                      f"deleting it, check it by hand.")
+                return False
         btn = page.locator('[data-testid="delete"]').first
         await btn.click(timeout=5000)
         await page.wait_for_timeout(1000)
@@ -1100,16 +1179,18 @@ def _is_published(url: str) -> bool:
 
 def _classify_publish(url: str) -> tuple:
     """
-    (status, note) for a published-ad URL. Free categories (phones, parts,
-    …) redirect with `freePublish=true` and the ad goes live immediately.
-    Paid categories (transport/cars: 5 MDL "Basic" fee) land on the same
-    /services page WITHOUT freePublish — the ad is created but sits in the
-    cabinet's "unpaid" tab until the fee is paid. Verified live 2026-07-16.
+    (status, note) for a published-ad URL — this is where "free or paid" is
+    decided. A free publication redirects with `freePublish=true` and the ad
+    goes live immediately. With the subcategory's monthly free quota used up,
+    999.md lands on the same /services page WITHOUT freePublish and offers
+    only paid packages (Basic 4-5 MDL) — the ad exists but stays unpaid
+    ("Trebuie să achitați" in cabinet → Toate). Verified live 2026-07-16
+    and 2026-09-13.
     """
     if "/services/" in url and "freePublish=true" not in url:
         return ("needs_payment",
-                "Anunț creat, dar categoria cere taxă de publicare — "
-                "achită din cabinet (tab Neachitate) ca să apară pe site.")
+                "Anunț creat peste limita lunară gratuită — a rămas neachitat "
+                "(cabinet → Toate → „Trebuie să achitați”).")
     return "success", ""
 
 
@@ -1142,7 +1223,12 @@ async def _fill_visible_fields(page, listing: dict, done: dict) -> int:
     this to a fixpoint because most 999.md forms mount progressively —
     e.g. on mobile-phones, Marcă/Model/Preț/Regiune only appear after
     "Tip dispozitiv" is selected.
+
+    The onboarding coach-mark is cleared first on every pass: it mounts a
+    second or two after the form does, so a single up-front dismissal can
+    race it, and it blocks the very first field it points at.
     """
+    await dismiss_onboarding(page)
     start_count = len(done)
 
     async def once(key, coro_fn, desc):
@@ -1253,23 +1339,6 @@ async def repost_listing(page, listing: dict, dry_run: bool = False) -> dict:
     title = listing.get("title", "Untitled")
     print(f"  Reposting: {title}")
 
-    # Hard rule: NEVER pay. Known fee-only categories are skipped before the
-    # form is even opened (posting there always ends at the 5 MDL "Ultimul
-    # pas" payment page, leaving a stray unpaid ad).
-    cat_url = listing.get("category_url", "") or ""
-    if any(p in cat_url for p in PAID_SUBCATEGORIES):
-        entry = {
-            "original_url": listing.get("url", ""),
-            "title": title,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "status": "skipped_paid",
-            "new_url": "",
-            "error": ("Categorie cu taxă de publicare pe 999.md (fără "
-                      "opțiune gratuită) — repostare sărită, nu plătim."),
-        }
-        print(f"    [SKIP] {entry['error']}")
-        return entry
-
     # Build add URL with category pre-selected.
     # category_url is like /ro/list/transport/spare-parts-for-cars
     # The add form expects: /ro/add?category=transport&subcategory=transport%2Fspare-parts-for-cars
@@ -1369,6 +1438,10 @@ async def repost_listing(page, listing: dict, dry_run: bool = False) -> dict:
         for step in range(1, MAX_WIZARD_STEPS + 1):
             if _is_published(page.url):
                 break
+            # The add form's IntroJS coach-mark overlays (and blocks
+            # clicks on) the first field of the step — clear it before
+            # touching anything.
+            await dismiss_onboarding(page)
             # Some categories hide most checkbox features behind an
             # "Afișează totul" expander — open before filling each step.
             await expand_collapsibles(page)
@@ -1456,15 +1529,19 @@ async def repost_listing(page, listing: dict, dry_run: bool = False) -> dict:
             log_entry["status"], note = _classify_publish(new_url)
             log_entry["error"] = note
             if log_entry["status"] == "needs_payment":
-                # Safety net for paid categories not in PAID_SUBCATEGORIES:
-                # the ad already exists but can only go live for money —
-                # delete it so nothing piles up in cabinet → Neachitate.
-                m = re.search(r"/(?:services/)?(\d+)", new_url.split("?")[0])
-                if m and await delete_ad(page, m.group(1)):
+                # No free slot left: the ad already exists but can only go
+                # live for money — delete it so no unpaid ad piles up. The id
+                # is the LAST path segment; the old "first digits in the URL"
+                # search matched "999" in the domain and deleted nothing (the
+                # 2026-09-03 unpaid ads were left behind that way).
+                ad_id = new_url.split("?")[0].rstrip("/").rsplit("/", 1)[-1]
+                if ad_id.isdigit() and await delete_ad(page, ad_id,
+                                                       require_unpaid=True):
                     log_entry["status"] = "skipped_paid"
                     log_entry["error"] = (
-                        "Categorie cu taxă — anunțul creat a fost șters "
-                        "automat (nu plătim).")
+                        "Fără anunț gratuit disponibil luna asta în această "
+                        "subcategorie — anunțul creat a fost șters automat "
+                        "(nu plătim).")
         elif form_errors:
             log_entry["status"] = "incomplete"
             log_entry["error"] = "Form validation: " + "; ".join(form_errors)
