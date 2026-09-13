@@ -1020,10 +1020,10 @@ class App999(ctk.CTk):
 
     def _on_repost_done(self, results: list):
         success = sum(1 for r in results if r.get("status") == "success")
-        # Paid categories (e.g. Autoturisme) are never paid for: known ones
-        # are skipped upfront; unexpected ones get their created ad deleted.
-        # Both end up as status "skipped_paid". "needs_payment" only remains
-        # if that automatic delete failed (ad sits in cabinet → Neachitate).
+        # Nothing is ever paid for: when 999.md answers a publish with its fee
+        # page (no free slot left this month) the created ad is deleted and
+        # the status becomes "skipped_paid". "needs_payment" only remains if
+        # that delete failed (the ad sits unpaid in the cabinet).
         skipped_paid = sum(1 for r in results
                            if r.get("status") == "skipped_paid")
         needs_pay = sum(1 for r in results
@@ -1031,7 +1031,7 @@ class App999(ctk.CTk):
         total = len(results)
         summary = f"Done: {success}/{total} reposted successfully."
         if skipped_paid:
-            summary += f" {skipped_paid} skipped (paid category)."
+            summary += f" {skipped_paid} skipped (no free slot this month)."
         if needs_pay:
             summary += f" {needs_pay} stuck unpaid in cabinet!"
         self.status_lbl.configure(text=summary)
@@ -1053,10 +1053,10 @@ class App999(ctk.CTk):
         messagebox.showinfo(
             "Repost Complete",
             f"Reposted {success} of {total} listing(s)."
-            + (f"\n{skipped_paid} skipped — paid category, never paying."
-               if skipped_paid else "")
-            + (f"\n{needs_pay} could not be cleaned up — check cabinet "
-               f"tab Neachitate." if needs_pay else "")
+            + (f"\n{skipped_paid} skipped — 999.md wanted a fee (no free "
+               f"slot this month), never paying." if skipped_paid else "")
+            + (f"\n{needs_pay} could not be cleaned up — check cabinet → "
+               f"Toate for „Trebuie să achitați”." if needs_pay else "")
             + f"\n\n{detail}")
 
     # ── Console toggle ────────────────────────────────────────────────────────
