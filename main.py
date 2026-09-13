@@ -143,8 +143,8 @@ async def login(page, max_attempts: int = 3):
     """
     Log in via Simpals ID. Verified live 2026-07-12 — the flow has three
     states we must handle explicitly:
-      • password form  → fill + submit (wait for hydration first: filling the
-        React form too early makes the submit click a silent no-op);
+      • password form  → fill + submit (wait for reCAPTCHA and hydration
+        first: submitting too early sends no login request at all);
       • auth-confirm interstitial → click 'Accesați site-ul 999.md'. When a
         SID session already exists, /login redirects straight here with NO
         password form, so this must be handled on entry too;
@@ -176,6 +176,17 @@ async def login(page, max_attempts: int = 3):
             await page.wait_for_timeout(500)
 
         if state == "form":
+            # "Intră" only sends the login once Google reCAPTCHA has loaded.
+            # Clicked earlier, no request goes out and the page just says
+            # "Something went wrong" (2026-09-13: every first attempt failed
+            # that way and only the retry got in, ~20 s lost per account).
+            try:
+                await page.wait_for_function(
+                    "() => window.grecaptcha && "
+                    "typeof window.grecaptcha.execute === 'function'",
+                    timeout=10_000)
+            except Exception:
+                pass                             # no reCAPTCHA: old path
             await page.wait_for_timeout(700)     # let React attach handlers
             await page.fill('input[type="text"]', EMAIL)
             await page.fill('input[type="password"]', PASSWORD)
